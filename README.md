@@ -986,12 +986,6 @@ if your_condition:
 
 ---
 
-## 📄 License
-
-MIT License - Feel free to modify and distribute
-
----
-
 ## 🙏 Credits
 
 - **OPNsense** - Network security platform

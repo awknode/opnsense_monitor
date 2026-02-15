@@ -52,6 +52,7 @@ last_threat_count = 0
 last_threat_alert_time = None
 connection_baseline = deque(maxlen=168)  # 7 days of hourly connection counts
 last_connection_alert_time = None
+last_bandwidth_hog_alert_time = None
 
 # Internet connectivity tracking
 internet_is_up = True
@@ -300,9 +301,8 @@ def handle_opnsense_command(text, channel_id, user_id):
 
         elif subcommand == 'insights':
             insights = detect_smart_patterns()
-#            client.chat_postMessage(channel=channel_id, text=insights)
-            safe_reply(insights) 
-
+            safe_reply(insights)
+            
         elif subcommand == 'blocklist' or subcommand == 'blocked':
             # Get blocked IPs from firewall alias
             blocked_data = fetch_opn("firewall/alias/getItem/blocked_hosts")
@@ -317,35 +317,157 @@ def handle_opnsense_command(text, channel_id, user_id):
                 blocklist_text = "*🚫 Blocked IPs*\n_Blocklist alias not found_\n_Create 'blocked_hosts' alias in Firewall > Aliases_"
             safe_reply(blocklist_text)
 
-        elif subcommand == 'insights':
-            insights = detect_smart_patterns()
-            safe_reply(insights) 
-
         elif subcommand == 'plex-privacy':
-            # Check what Plex is sending using zenarmor/status
             plex_text = "*📺 Plex Privacy Status*\n\n"
             
-            zen_data = fetch_opn("zenarmor/status")
+            # Your Plex server IP
+            plex_server_ip = "10.13.20.98"
             
-            if zen_data:
-                # Get top apps/categories
-                apps = zen_data.get('top_apps_categories', {}).get('labels', [])
+            zen_status = fetch_opn("zenarmor/status")
+            
+            if zen_status:
+                # Check if Plex is actively transmitting data
+                top_hosts = zen_status.get('top_local_hosts', {}).get('labels', [])
                 
-                # Look for streaming/media apps
-                plex_indicators = ['plex', 'streaming', 'video', 'media', 'entertainment']
-                found_streaming = [app for app in apps if any(ind in app.lower() for ind in plex_indicators)]
-                
-                if found_streaming:
-                    plex_text += "*Active Streaming/Media:*\n"
-                    for app in found_streaming[:5]:
-                        plex_text += f"• {app}\n"
-                    plex_text += "\n_Plex may be sending viewing data to external servers_\n"
-                    plex_text += "_Check OPNsense > Zenarmor > Reports for details_"
+                if plex_server_ip in top_hosts:
+                    # Plex IS transmitting
+                    plex_index = top_hosts.index(plex_server_ip)
+                    
+                    # Get bandwidth
+                    datasets = zen_status.get('top_local_hosts', {}).get('datasets', [])
+                    if datasets:
+                        data_values = datasets[0].get('data', [])
+                        if plex_index < len(data_values):
+                            plex_bytes = data_values[plex_index]
+                            plex_gb = plex_bytes / (1024**3)
+                            
+                            plex_text += f"🔴 *ACTIVE STREAMING DETECTED*\n\n"
+                            plex_text += f"📊 Traffic: `{plex_gb:.2f} GB`\n"
+                            plex_text += f"🏆 Rank: #{plex_index + 1} of {len(top_hosts)}\n\n"
+                            plex_text += "*Telemetry Being Sent:*\n"
+                            plex_text += "• 📺 Watch history\n"
+                            plex_text += "• ⭐ Ratings/reviews\n"
+                            plex_text += "• 📊 Server stats\n"
+                            plex_text += "• 🎬 Metadata updates\n"
+                        else:
+                            plex_text += f"🟡 *Plex Active* but no bandwidth data"
+                    else:
+                        plex_text += f"🟡 *Plex Active* but no bandwidth data"
                 else:
-                    plex_text += "_No active streaming detected_\n"
-                    plex_text += f"_Active devices: {zen_data.get('active_device', 0)}_"
+                    plex_text += f"✅ *No Active Streaming*\n\n"
+                    plex_text += f"Plex server not in top {len(top_hosts)} hosts\n"
+                    plex_text += f"Total devices: {zen_status.get('active_device', 0)}\n\n"
+                    plex_text += "_Note: Zenarmor data updates every 5-15 minutes_"
             else:
-                plex_text += "_Zenarmor status unavailable_"
+                plex_text += "_Zenarmor unavailable_"
+            
+            safe_reply(plex_text)
+
+        elif subcommand == 'plex-status' or subcommand == 'plex':
+            """Real-time Plex streaming detection via WireGuard bandwidth"""
+            plex_text = "*📺 Plex Streaming Status*\n\n"
+            
+            # Method 1: Check WireGuard for heavy downloads (remote streaming)
+            data = fetch_opn("wireguard/service/show")
+            streaming_detected = False
+            
+            if data and 'rows' in data:
+                streaming_peers = []
+                
+                for item in data['rows']:
+                    if not isinstance(item, dict) or item.get('type') != 'peer':
+                        continue
+                    
+                    peer_name = item.get('name', 'Unknown')
+                    peer_id = f"{item.get('ifname', 'wg')}:{item.get('public-key', '')[:16]}"
+                    
+                    # Check if active session with baseline
+                    if peer_id in wg_baselines:
+                        rx_bytes = int(item.get('transfer-rx', 0))
+                        tx_bytes = int(item.get('transfer-tx', 0))
+                        base = wg_baselines[peer_id]
+                        
+                        # Calculate session bandwidth
+                        session_rx_gb = (rx_bytes - base['rx']) / (1024**3)
+                        session_tx_gb = (tx_bytes - base['tx']) / (1024**3)
+                        
+                        # If downloading >0.5 GB (likely streaming)
+                        if session_rx_gb > 0.5:
+                            streaming_peers.append({
+                                'name': peer_name,
+                                'download': session_rx_gb,
+                                'upload': session_tx_gb,
+                                'total': session_rx_gb + session_tx_gb
+                            })
+                            streaming_detected = True
+                
+                if streaming_peers:
+                    # Sort by download (highest first)
+                    streaming_peers.sort(key=lambda x: x['download'], reverse=True)
+                    
+                    plex_text += "🎬 *STREAMING DETECTED (Remote)*\n\n"
+                    for peer in streaming_peers:
+                        plex_text += f"• `{peer['name']}`\n"
+                        plex_text += f"  ↓ {peer['download']:.2f} GB  ↑ {peer['upload']:.2f} GB\n"
+                    
+                    plex_text += "\n_Heavy VPN downloads indicate active streaming_"
+                else:
+                    plex_text += "📱 *VPN Status*\n"
+                    active_vpn = len([p for p in wg_active_peers])
+                    if active_vpn > 0:
+                        plex_text += f"{active_vpn} active connection(s), no heavy downloads\n\n"
+                    else:
+                        plex_text += "No active VPN connections\n\n"
+            
+            # Method 2: Check Zenarmor top hosts (local streaming)
+            zen_status = fetch_opn("zenarmor/status")
+            if zen_status:
+                plex_server_ip = "10.13.20.98"
+                top_hosts = zen_status.get('top_local_hosts', {}).get('labels', [])
+                
+                if plex_server_ip in top_hosts:
+                    plex_index = top_hosts.index(plex_server_ip)
+                    datasets = zen_status.get('top_local_hosts', {}).get('datasets', [])
+                    
+                    if datasets:
+                        data_values = datasets[0].get('data', [])
+                        if plex_index < len(data_values):
+                            plex_bytes = data_values[plex_index]
+                            plex_gb = plex_bytes / (1024**3)
+                            
+                            if not streaming_detected:
+                                plex_text += "\n🏠 *LOCAL STREAMING DETECTED*\n\n"
+                            else:
+                                plex_text += "\n📊 *Plex Server Activity*\n\n"
+                            
+                            plex_text += f"• Traffic: `{plex_gb:.2f} GB`\n"
+                            plex_text += f"• Rank: #{plex_index + 1} of {len(top_hosts)} hosts\n"
+                            streaming_detected = True
+            
+            # If nothing detected
+            if not streaming_detected:
+                plex_text += "✅ *No Streaming Detected*\n\n"
+                plex_text += "_Neither VPN bandwidth nor local traffic indicates active streaming_\n\n"
+                plex_text += "💡 *Reasons:*\n"
+                plex_text += "• No one is currently watching\n"
+                plex_text += "• Streaming locally on same subnet\n"
+                plex_text += "• Data hasn't updated yet (5-15 min delay)"
+            
+            safe_reply(plex_text)
+
+        elif subcommand == 'plex-live':
+            """Show who's currently streaming via Plex API"""
+            plex_text = "*📺 Plex Live Sessions*\n\n"
+            
+            plex_text += "⚠️ *Feature Not Configured*\n\n"
+            plex_text += "To enable live Plex session tracking:\n\n"
+            plex_text += "1. Get your Plex token:\n"
+            plex_text += "   • Settings > Account > Get Token\n\n"
+            plex_text += "2. Add to environment variables:\n"
+            plex_text += "   `PLEX_TOKEN=your_token_here`\n"
+            plex_text += "   `PLEX_URL=http://10.13.20.98:32400`\n\n"
+            plex_text += "3. Restart container\n\n"
+            plex_text += "For now, use `/opnsense plex-status` for bandwidth-based detection"
             
             safe_reply(plex_text)
         
@@ -359,11 +481,12 @@ def handle_opnsense_command(text, channel_id, user_id):
 `/opnsense network-health` - Overall health score
 `/opnsense apps` - Application usage breakdown
 `/opnsense hogs` - Find bandwidth hogs
+`/opnsense plex-status` - Real-time streaming detection
+`/opnsense plex-privacy` - Check Plex telemetry
 `/opnsense watch <ip> <name>` - Add a Hero Device
 `/opnsense block <ip>` - Block an IP address
 `/opnsense unblock <ip>` - Unblock an IP
-`/opnsense blocklist` - Show all blocked IPs
-`/opnsense plex-privacy` - Check Plex telemetry"""
+`/opnsense blocklist` - Show all blocked IPs"""
             safe_reply(help_text)
 
     except Exception as e:
@@ -730,7 +853,9 @@ def get_port_activity():
         return f"*🔌 Port Activity*\n_Error: {str(e)[:50]}_"
 
 def detect_bandwidth_hogs():
-    """Find devices using unusual amounts of bandwidth"""
+    """Find devices using unusual amounts of bandwidth - with cooldown"""
+    global last_bandwidth_hog_alert_time
+    
     try:
         zen_status = fetch_opn("zenarmor/status")
         if not zen_status:
@@ -744,7 +869,7 @@ def detect_bandwidth_hogs():
             return None
         
         data_values = datasets[0].get('data', [])
-        
+
         if not data_values or len(data_values) == 0:
             return None
         
@@ -778,6 +903,19 @@ def detect_bandwidth_hogs():
                 })
         
         if hogs:
+            # Check cooldown (6 hours)
+            now = datetime.now()
+            if last_bandwidth_hog_alert_time:
+                hours_since = (now - last_bandwidth_hog_alert_time).total_seconds() / 3600
+                if hours_since < 6.0:
+                    # Still in cooldown
+                    hours_remaining = 6.0 - hours_since
+                    print(f"   🐷 Bandwidth hogs detected but in cooldown ({hours_remaining:.1f}h remaining)")
+                    return None
+            
+            # Update last alert time
+            last_bandwidth_hog_alert_time = now
+            
             report = "🐷 *Bandwidth Hog Alert*\n\n"
             for hog in hogs:
                 report += f"• *{hog['name']}*: {hog['gb']:.2f} GB ({hog['percent']:.1f}% of total)\n"
@@ -1751,15 +1889,12 @@ def get_speedtest_data(retry=True, max_retries=5, require_fresh=False):
     return {'download': "-", 'ping': "-", 'upload': "-", 'is_cached': False, 'download_raw': 0, 'upload_raw': 0, 'degraded': False}
 
 def track_wan_traffic():
-    """
-    Track total WAN interface traffic (all internet-bound traffic, not just WireGuard)
-    Uses interface statistics API to get total bytes in/out
-    """
+    """Track total WAN interface traffic"""
     global last_interface_stats, daily_bandwidth, weekly_stats
     
-    # Get interface statistics from OPNsense
     data = fetch_opn("diagnostics/interface/getInterfaceStatistics")
     if not data or 'statistics' not in data:
+        print("   ⚠️ No interface statistics available")
         return
     
     today = datetime.now().strftime('%Y-%m-%d')
@@ -1811,6 +1946,8 @@ def track_wan_traffic():
         'tx': bytes_sent,
         'timestamp': datetime.now()
     }
+    print(f"   📊 WAN tracking: {daily_bandwidth[today]['wan_download']:.3f} GB down, {daily_bandwidth[today]['wan_upload']:.3f} GB up")
+
 
 def check_wireguard_peers():
     global last_wg_handshakes, wg_baselines, wg_active_peers
@@ -1823,7 +1960,6 @@ def check_wireguard_peers():
         HANDSHAKE_TIMEOUT = 180
         current_active_this_poll = set()
 
-        # 1. FIXED: Use 'rows' instead of 'wg_data'
         for item in rows:
             if not isinstance(item, dict) or item.get('type') != 'peer':
                 continue
@@ -1883,12 +2019,29 @@ def check_wireguard_peers():
                         pg=f"{ip_info['isp']}",                   
                         ul=f"{clean_ip}",                              
                         gw=f"{ip_info['threat_level']}",              
-                        extra_text=extra,  # <--- Clean, unique data only
+                        extra_text=extra,
                         l1="📍 Location",    
                         l2="🏢 ISP",         
                         l3="🌐 IP Address",  
                         l4="🛡️ Threat Level" 
                     )
+                
+                # Track hourly usage (for ALL active peers, not just new ones)
+                if peer_id in wg_baselines:
+                    current_hour = datetime.now().hour
+                    today_date = datetime.now().strftime('%Y-%m-%d')
+                    
+                    cur_rx = raw_rx
+                    cur_tx = raw_tx
+                    base = wg_baselines[peer_id]
+                    
+                    # Calculate delta since baseline (session total)
+                    session_rx_gb = (cur_rx - base['rx']) / (1024**3)
+                    session_tx_gb = (cur_tx - base['tx']) / (1024**3)
+                    session_total_gb = session_rx_gb + session_tx_gb
+                    
+                    # Add to this hour's usage
+                    wg_hourly_usage[today_date][current_hour] = session_total_gb
 
         # --- DISCONNECTION DETECTED ---
         disconnected_peers = wg_active_peers - current_active_this_poll
@@ -1908,15 +2061,16 @@ def check_wireguard_peers():
 
             print(f"🔓 WG DISCONNECT: {p_name}")
 
-            # This now sends the data AND the correct names for the boxes
             send_grid_notification(
                 f"🔓 WireGuard Disconnected: {p_name}",
                 dl=f"{max(0, session_tx_mb):.2f} MB",
                 pg="Session Ended",
                 ul=f"{max(0, session_rx_mb):.2f} MB",
                 gw="Status: Offline",
-                l1="📥 Total Down",  # Clearer label
-                l3="📤 Total Up"     # Clearer label
+                l1="📥 Total Down",
+                l2="⏱️ Session",      # ← Added l2
+                l3="📤 Total Up",
+                l4="🌐 Status"        # ← Added l4
             )
 
             wg_active_peers.discard(p_id)
@@ -2009,15 +2163,23 @@ def check_dhcp_leases(is_startup=False):
 
     for lease in data['rows']:
         if use_kea:
-            # Kea DHCP format
-            mac = lease.get('hwaddr', lease.get('hw-address', lease.get('mac', ''))).lower()
-            ip = lease.get('address', lease.get('ip-address', 'N/A'))
-            hostname = lease.get('hostname', lease.get('client-hostname', ''))
-            state = lease.get('state', lease.get('lease-state', 0))
-            state_str = str(state).lower()
-            is_active = state_str in ['0', 'default', 'active']
+            mac = lease.get('hwaddr', '').lower()
+            ip = lease.get('address', 'N/A')
+            hostname = lease.get('hostname', '')
+            cltt = lease.get('cltt', 0)
+            valid_lifetime = lease.get('valid_lifetime', 3600)
+        
+            try:
+                cltt = int(cltt)
+                valid_lifetime = int(valid_lifetime)
+            except (ValueError, TypeError):
+                cltt = 0
+                valid_lifetime = 3600
+        
+            now_timestamp = int(datetime.now().timestamp())
+            time_since_seen = now_timestamp - cltt
+            is_active = (time_since_seen < valid_lifetime)
         else:
-            # ISC DHCP format
             mac = lease.get('mac', '').lower()
             ip = lease.get('address', 'N/A')
             hostname = lease.get('hostname', '')
@@ -2026,14 +2188,12 @@ def check_dhcp_leases(is_startup=False):
 
         if not mac: continue
 
-        # 1. Hostname Mapping
         if mac in dhcp_reservations:
             hostname = dhcp_reservations[mac]
         elif not hostname or hostname == 'Unknown':
             hostname = f"Device-{ip.split('.')[-1]}"
 
-        # 2. Track this device for current scan
-        current_leases[mac] = {'hostname': hostname, 'ip': ip, 'state': state, 'active': is_active}
+        current_leases[mac] = {'hostname': hostname, 'ip': ip, 'active': is_active}
         
         # 3. CHECK FOR STATUS CHANGES
         if not is_startup:
@@ -2370,10 +2530,17 @@ last_weekly_report_week = None
 while True:
     loop_count += 1
     now = datetime.now()
+    
     if loop_count % NETWORK_CHECK_INTERVAL == 0:
+        # Check if it's a new day
+        today = now.strftime('%Y-%m-%d')
+        if today not in daily_bandwidth:
+            print(f"   📅 New day detected: {today}")
+        
         print(f"\n🔄 Full Health Check - {now.strftime('%Y-%m-%d %H:%M:%S')}")
-        track_wan_traffic()  # Track total WAN traffic
+        track_wan_traffic()
         check_internet_outage()
+        
         # Collect security events every check
         security_summary = collect_security_events()
         if security_summary['severity_high'] > 5:

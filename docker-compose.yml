@@ -6,14 +6,14 @@ services:
     env_file: .env
     environment:
       - PYTHONUNBUFFERED=1
-      - TZ=America/Phoenix
+      - TZ=America/Denver
       - OPNSENSE_URL=${OPNSENSE_URL}
       - OPN_API_KEY=${OPN_API_KEY}
       - OPN_API_SECRET=${OPN_API_SECRET}
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
       - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
-      - OLLAMA_HOST=10.13.20.8
+      - OLLAMA_HOST=10.1.1.15
       - POLL_INTERVAL=120
       - SPEEDTEST_API_URL=http://speedtest_monitor/api/speedtest/latest
       # Bandwidth thresholds
@@ -40,7 +40,7 @@ services:
     environment:
       - TZ=America/Phoenix
       - OOKLA_EULA_GDPR=true
-      - APP_URL=http://10.13.20.8:8765
+      - APP_URL=http://10.1.1.15:8765
       - DB_CONNECTION=sqlite
       - SPEEDTEST_SCHEDULE=0 */6 * * *
       - PRUNE_RESULTS_OLDER_THAN=60

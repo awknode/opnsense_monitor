@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir \
     flask \
     ollama \
     psutil \
+    dotenv \
     slack_sdk
 COPY monitor.py /app/monitor.py
 CMD ["python", "-u", "/app/monitor.py"]

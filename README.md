@@ -154,7 +154,7 @@ A comprehensive Python-based monitoring solution that tracks WireGuard VPN conne
          │                      │                      │
          ▼                      ▼                      ▼
    OPNsense API          Slack Webhook          Speedtest API
-   10.13.20.1           (Notifications)         10.13.20.8:8765
+   10.1.1.1           (Notifications)         10.1.1.15:8765
 ```
 
 ### Data Flow
@@ -195,7 +195,7 @@ Create a `.env` file:
 
 ```bash
 # OPNsense Configuration
-OPNSENSE_URL=http://10.13.20.1
+OPNSENSE_URL=http://10.1.1.1
 OPN_API_KEY=your_api_key_here
 OPN_API_SECRET=your_api_secret_here
 
@@ -203,10 +203,10 @@ OPN_API_SECRET=your_api_secret_here
 SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
 SLACK_BOT_TOKEN=xoxb-your-bot-token
 SLACK_APP_TOKEN=xapp-your-app-token
-SLACK_CHANNEL_ID=C01234567  # Optional for hero alerts
+SLACK_CHANNEL_ID=  # Optional for hero alerts
 
 # Speedtest Configuration
-SPEEDTEST_API_URL=http://10.13.20.8:8765/api/speedtest/latest
+SPEEDTEST_API_URL=http://10.1.1.25:8765/api/speedtest/latest
 
 # Monitoring Thresholds
 POLL_INTERVAL=60
@@ -264,13 +264,13 @@ Add VIP devices for custom Batman-themed alerts:
 
 ```python
 HERO_WATCHLIST = {
-    "10.13.20.42": {
-        "name": "The Bat WiFi", 
+    "10.1.1.5": {
+        "name": "Desktop-WiFi", 
         "emoji": "🏎️", 
         "rank": "Legendary"
     },
-    "10.13.20.6": {
-        "name": "Beast Server", 
+    "10.1.1.15": {
+        "name": "Proxmox-Server", 
         "emoji": "🏰", 
         "rank": "Critical"
     }
@@ -360,7 +360,7 @@ DISCONNECT_CYCLE_WINDOW = 10
 🟢 New Device: iPhone-15
 
 🖥️ Hostname: iPhone-15
-🌐 IP Address: 10.13.20.123
+🌐 IP Address: 10.1.1.123
 🔖 MAC Address: aa:bb:cc:dd:ee:ff
 📊 Status: CONNECTED 🟢
 
@@ -446,9 +446,9 @@ Based on 156 measurements
 2. `phone-remote`: 1.89 GB (↓1.50 ↑0.39)
 
 🌐 Top WAN Talkers (Current)
-1. `The Bat WiFi`: 15.67 GB
-2. `Beast Server`: 8.21 GB
-3. `Plex-Server`: 6.89 GB
+1. `Desktop-WiFi`: 15.67 GB
+2. `Proxmox-Server`: 8.21 GB
+3. `VPN-Server`: 6.89 GB
 ```
 
 ---
@@ -470,6 +470,7 @@ Based on 156 measurements
 /opnsense unblock <ip>        - Unblock IP
 /opnsense blocklist           - Show all blocked IPs
 /opnsense plex-privacy        - Check Plex telemetry activity
+/opnsense plex-status         - Check Plex Status
 ```
 
 ### Interactive Buttons
@@ -617,7 +618,7 @@ Notifications include action buttons:
 known_dhcp_leases = {
     'aa:bb:cc:dd:ee:ff': {
         'hostname': 'laptop',
-        'ip': '10.13.20.50',
+        'ip': '10.1.1.50',
         'state': 'active',
         'active': True
     }
@@ -748,7 +749,7 @@ zen_status = fetch_opn("zenarmor/status")
         'datasets': [{'data': [bytes, ...]}]
     },
     'top_local_hosts': {
-        'labels': ['10.13.20.42', '10.13.20.8', ...],
+        'labels': ['10.1.1.25', '10.1.1.15', ...],
         'datasets': [{'data': [bytes, ...]}]
     },
     'top_detect_threats': {
@@ -777,13 +778,13 @@ GET https://ifconfig.co/json?ip={ip_address}
 
 **Speedtest:**
 ```python
-GET http://10.13.20.8:8765/api/speedtest/latest
-GET http://10.13.20.8:8765/api/speedtest/run  # Trigger
+GET http://10.1.1.15:8765/api/speedtest/latest
+GET http://10.1.1.15:8765/api/speedtest/run  # Trigger
 ```
 
 **AI Analysis (Ollama):**
 ```python
-POST http://10.13.20.8:11434/api/chat
+POST http://10.1.1.15:11434/api/chat
 # Model: llama3
 ```
 
@@ -825,10 +826,6 @@ POST http://10.13.20.8:11434/api/chat
 
 **6. Threat Alerts Every 2 Minutes**
 ```python
-# Old (broken):
-if "⚠️" in threat_intel:  # Crashes on None
-
-# Fixed:
 if threat_intel:  # Checks for None properly
 ```
 
@@ -954,7 +951,7 @@ Result:
 ### Add New Hero Device
 
 ```python
-HERO_WATCHLIST["10.13.20.99"] = {
+HERO_WATCHLIST["10.1.1.100"] = {
     "name": "New Hero",
     "emoji": "🦸",
     "rank": "Guardian"
@@ -982,12 +979,6 @@ if percentage > 20:  # Changed from 30
 if your_condition:
     insights.append(f"🔥 Your custom alert: {details}")
 ```
-
----
-
-## 📄 License
-
-MIT License - Feel free to modify and distribute
 
 ---
 

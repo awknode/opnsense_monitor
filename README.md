@@ -203,7 +203,7 @@ OPN_API_SECRET=your_api_secret_here
 SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
 SLACK_BOT_TOKEN=xoxb-your-bot-token
 SLACK_APP_TOKEN=xapp-your-app-token
-SLACK_CHANNEL_ID=C01234567  # Optional for hero alerts
+SLACK_CHANNEL_ID=  # Optional for hero alerts
 
 # Speedtest Configuration
 SPEEDTEST_API_URL=http://10.1.1.25:8765/api/speedtest/latest
@@ -826,10 +826,6 @@ POST http://10.1.1.15:11434/api/chat
 
 **6. Threat Alerts Every 2 Minutes**
 ```python
-# Old (broken):
-if "⚠️" in threat_intel:  # Crashes on None
-
-# Fixed:
 if threat_intel:  # Checks for None properly
 ```
 

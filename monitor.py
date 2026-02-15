@@ -10,11 +10,13 @@ import ollama
 import threading
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
+from dotenv import load_dotenv
 from slack_sdk.socket_mode import SocketModeClient
 from slack_sdk.web import WebClient
 from slack_sdk.socket_mode.response import SocketModeResponse
 
 # Silence SSL warnings
+load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Configuration ---
@@ -25,6 +27,9 @@ SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 SPEEDTEST_API = os.getenv("SPEEDTEST_API_URL", "http://10.13.20.8:8765/api/speedtest/latest")
+AGH_USER = os.getenv("ADGUARD_USERNAME")
+AGH_PASS = os.getenv("ADGUARD_PASSWORD")
+AGH_URL = os.getenv("ADGUARD_URL")
 
 # Bandwidth thresholds
 SPEED_DROP_THRESHOLD = float(os.getenv("SPEED_DROP_THRESHOLD", "0.5"))
@@ -53,6 +58,13 @@ last_threat_alert_time = None
 connection_baseline = deque(maxlen=168)  # 7 days of hourly connection counts
 last_connection_alert_time = None
 last_bandwidth_hog_alert_time = None
+
+# while true
+loop_count = 0
+last_daily_report_day = None
+last_weekly_report_week = None
+last_daily_report_date = ""
+last_monthly_report_month = None
 
 # Internet connectivity tracking
 internet_is_up = True
@@ -458,16 +470,53 @@ def handle_opnsense_command(text, channel_id, user_id):
         elif subcommand == 'plex-live':
             """Show who's currently streaming via Plex API"""
             plex_text = "*📺 Plex Live Sessions*\n\n"
-            
-            plex_text += "⚠️ *Feature Not Configured*\n\n"
-            plex_text += "To enable live Plex session tracking:\n\n"
-            plex_text += "1. Get your Plex token:\n"
-            plex_text += "   • Settings > Account > Get Token\n\n"
-            plex_text += "2. Add to environment variables:\n"
-            plex_text += "   `PLEX_TOKEN=your_token_here`\n"
-            plex_text += "   `PLEX_URL=http://10.13.20.98:32400`\n\n"
-            plex_text += "3. Restart container\n\n"
-            plex_text += "For now, use `/opnsense plex-status` for bandwidth-based detection"
+    
+            plex_url = "http://10.13.20.98:32400"
+            plex_token = os.getenv("PLEX_TOKEN")  # You need to add this
+    
+            if not plex_token:
+                plex_text += "⚠️ *Plex Token Required*\n\n"
+                plex_text += "Get your token:\n"
+                plex_text += "1. Open Plex Web (http://10.13.20.98:32400/web)\n"
+                plex_text += "2. Play any video\n"
+                plex_text += "3. Click ⋮ > Get Info > View XML\n"
+                plex_text += "4. Look for `X-Plex-Token=` in the URL\n"
+                plex_text += "5. Add to .env: `PLEX_TOKEN=your_token_here`"
+            else:
+                try:
+                    # Get active sessions
+                    response = requests.get(
+                        f"{plex_url}/status/sessions",
+                        headers={"X-Plex-Token": plex_token},
+                        timeout=5
+                    )
+                    
+                    if response.status_code == 200:
+                        import xml.etree.ElementTree as ET
+                        root = ET.fromstring(response.content)
+                        
+                        sessions = root.findall('.//Video') + root.findall('.//Track')
+                        
+                        if sessions:
+                            plex_text += f"🎬 *{len(sessions)} Active Stream(s)*\n\n"
+                            
+                            for session in sessions:
+                                title = session.get('title', 'Unknown')
+                                user = session.find('.//User')
+                                username = user.get('title', 'Unknown') if user is not None else 'Unknown'
+                                player = session.find('.//Player')
+                                device = player.get('device', 'Unknown') if player is not None else 'Unknown'
+                                
+                                plex_text += f"• *{username}* watching `{title}`\n"
+                                plex_text += f"  Device: {device}\n\n"
+                        else:
+                            plex_text += "✅ *No Active Streams*\n"
+                            plex_text += "Plex server is idle"
+                    else:
+                        plex_text += f"❌ Plex API Error: {response.status_code}"
+                        
+                except Exception as e:
+                    plex_text += f"❌ Error: {str(e)[:100]}"
             
             safe_reply(plex_text)
         
@@ -1345,6 +1394,30 @@ def get_zenarmor_threat_details():
         print(f"⚠️ Zenarmor threat check failed: {e}")
         return None
 
+def get_adguard_stats():
+    try:
+        # The /control/stats endpoint provides the block counts
+        url = f"{AGH_URL}/control/stats"
+        response = requests.get(url, auth=(AGH_USER, AGH_PASS), timeout=5)
+        
+        if response.status_code == 200:
+            data = response.json()
+            dns_queries = data.get('num_dns_queries', 0)
+            blocked = data.get('num_blocked_filtering', 0)
+            
+            # Calculate a quick percentage
+            rate = (blocked / dns_queries * 100) if dns_queries > 0 else 0
+            
+            return (
+                f"🛡️ *AdGuard Defense Report*\n"
+                f"• Total Queries: `{dns_queries}`\n"
+                f"• Threats Blocked: `{blocked}` ({rate:.1f}%)\n"
+            )
+        else:
+            return "🛡️ AdGuard: Unable to fetch stats (Auth failed)."
+    except Exception as e:
+        return f"🛡️ AdGuard: Error connecting ({str(e)[:30]})"
+
 def get_security_summary():
     """Generate security event summary for reports"""
     now = datetime.now()
@@ -2103,7 +2176,6 @@ def check_dhcp_leases(is_startup=False):
                 reservations_data = fetch_opn(endpoint)
                 if reservations_data and 'rows' in reservations_data and len(reservations_data['rows']) > 0:
                     dhcp_reservations.clear()
-                    # print(f"   📍 Found reservations at: {endpoint}")
                     
                     for res in reservations_data['rows']:
                         # Try multiple field name variations
@@ -2112,11 +2184,8 @@ def check_dhcp_leases(is_startup=False):
                         
                         if mac and hostname:
                             dhcp_reservations[mac] = hostname
-                            # if is_startup and len(dhcp_reservations) <= 3:  # Show first 3 as examples
-                                # print(f"      • {mac} → {hostname}")
                     
                     if dhcp_reservations:
-                        # print(f"   📌 Loaded {len(dhcp_reservations)} DHCP reservations")
                         loaded = True
                         break
             except Exception as e:
@@ -2126,13 +2195,11 @@ def check_dhcp_leases(is_startup=False):
             print(f"   ⚠️  No DHCP reservations API found - will use DHCP lease hostnames only")
     
     # Try Kea DHCP first (more accurate), fall back to ISC DHCP
-    # Kea DHCP has multiple possible endpoints depending on configuration
     kea_endpoints = [
-        "kea/leases4/search",      # Standard Kea plugin
-        "kea/dhcpv4/lease4-get-all",  # Alternative endpoint
-        "kea/control_agent/lease4-get-all"  # Control agent endpoint
+        "kea/leases4/search",
+        "kea/dhcpv4/lease4-get-all",
     ]
-    
+
     kea_data = None
     use_kea = False
     
@@ -2163,36 +2230,34 @@ def check_dhcp_leases(is_startup=False):
 
     for lease in data['rows']:
         if use_kea:
-            mac = lease.get('hwaddr', '').lower()
-            ip = lease.get('address', 'N/A')
-            hostname = lease.get('hostname', '')
-            cltt = lease.get('cltt', 0)
-            valid_lifetime = lease.get('valid_lifetime', 3600)
-        
-            try:
-                cltt = int(cltt)
-                valid_lifetime = int(valid_lifetime)
-            except (ValueError, TypeError):
-                cltt = 0
-                valid_lifetime = 3600
-        
-            now_timestamp = int(datetime.now().timestamp())
-            time_since_seen = now_timestamp - cltt
-            is_active = (time_since_seen < valid_lifetime)
+            # Kea DHCP format - try multiple field name variations
+            mac = lease.get('hwaddr', lease.get('hw-address', lease.get('mac', ''))).lower()
+            ip = lease.get('address', lease.get('ip-address', 'N/A'))
+            hostname = lease.get('hostname', lease.get('client-hostname', ''))
+            state = lease.get('state', lease.get('lease-state', 0))
+            
+            # Kea DHCP: state 0 = default/active
+            # Note: Kea doesn't update state in real-time, so this shows lease status
+            state_str = str(state).lower()
+            is_active = state_str in ['0', 'default', 'active']
         else:
+            # ISC DHCP format
             mac = lease.get('mac', '').lower()
             ip = lease.get('address', 'N/A')
             hostname = lease.get('hostname', '')
             state = lease.get('state', 'unknown')
             is_active = (state == 'active')
 
-        if not mac: continue
+        if not mac: 
+            continue
 
+        # 1. Hostname Mapping
         if mac in dhcp_reservations:
             hostname = dhcp_reservations[mac]
         elif not hostname or hostname == 'Unknown':
             hostname = f"Device-{ip.split('.')[-1]}"
 
+        # 2. Track this device for current scan
         current_leases[mac] = {'hostname': hostname, 'ip': ip, 'active': is_active}
         
         # 3. CHECK FOR STATUS CHANGES
@@ -2218,15 +2283,17 @@ def check_dhcp_leases(is_startup=False):
                     if is_new_device:
                         extra = "First time seen on network"
                         is_anomaly, anomaly_desc = detect_dhcp_anomaly()
-                        if is_anomaly: extra += f"\n⚠️ ANOMALY: {anomaly_desc}"
+                        if is_anomaly: 
+                            extra += f"\n⚠️ ANOMALY: {anomaly_desc}"
                         send_dhcp_notification(f"🟢 New Device: {hostname}", hostname, ip, mac, "New Lease", extra_text=extra)
                     else:
                         extra = "Device reconnected" if is_active else "Device left network"
                         is_unstable, instability_desc = detect_disconnect_cycle(mac, hostname)
-                        if is_unstable: extra += f"\n⚠️ UNSTABLE: {instability_desc}"
+                        if is_unstable: 
+                            extra += f"\n⚠️ UNSTABLE: {instability_desc}"
                         send_dhcp_notification(f"📡 {hostname}", hostname, ip, mac, status_label, extra_text=extra)
 
-        # 4. Update Stats (Still inside the loop)
+        # 4. Update Stats
         if is_active:
             active_in_api += 1
             weekly_stats['devices_seen'].add(hostname)
@@ -2523,9 +2590,6 @@ send_grid_notification("🚀 Watchtower Online", speed['download'] if speed['dow
 print("✅ Startup complete! Entering monitoring loop...")
 print("="*60)
 
-loop_count = 0
-last_daily_report_day = None
-last_weekly_report_week = None
 
 while True:
     loop_count += 1
@@ -2565,7 +2629,6 @@ while True:
                 l1="Status", l2="Action", l3="Priority", l4="State"
             )
         
-        # Check for bandwidth hogs (every 10 minutes)
         if loop_count % 60 == 0:  # Every 10 minutes
             hog_alert = detect_bandwidth_hogs()
             if hog_alert:
@@ -2581,27 +2644,33 @@ while True:
 
 
         current_zen = get_service_status('zenarmor')
-        # 1. Fetch the actual threat details (who, what, where)
         threat_intel = get_zenarmor_threat_details()
-        if threat_intel:
+        adguard_intel = get_adguard_stats()
+        is_actual_threat = threat_intel and "⚠️" in threat_intel
+
+        if is_actual_threat:
             send_grid_notification( 
-                "🛡️ Zenarmor Security Alert", 
-                dl="Phishing/Malware",  
-                pg=f"{threat_intel.count('⚠️')} Threats",  
+                "🛡️ Network Defense Alert", 
+                dl="Zenarmor + Adguard",  
+                pg=f"{threat_intel.count('⚠️')} Active Threats",  
                 ul="Manual Review",  
                 gw="Action Required", 
-                extra_text=f"*Recent Activity:*\n{threat_intel}", 
+                extra_text=(
+                    f"{adguard_intel}\n" # Include AdGuard stats for context
+                    f"🛑 *Security Threats Found:*\n{threat_intel}"
+                ), 
                 l1="Type", l2="Count", l3="Status", l4="Priority" 
             )
+
+        else:
+            print(f"✅ Clean Sweep: {adguard_intel.strip()}")
                 
         if "DOWN" in current_zen and "ACTIVE" in last_zen_state:
-            # Track service downtime
             service_health['zenarmor']['last_restart'] = now
             service_health['zenarmor']['restart_count'] += 1
             weekly_stats['service_incidents'].append({'service': 'Zenarmor', 'time': now})
             send_grid_notification("🚨 SECURITY ALERT: Zenarmor is DOWN", dl="Action Required", pg="Service stopped", ul="WAN guarded by Suricata", gw="Check OPNsense", extra_text="Zenarmor L7 engine has stopped responding.", add_buttons="service_down")
         elif "ACTIVE" in current_zen and "DOWN" in last_zen_state:
-            # Calculate downtime
             if service_health['zenarmor']['last_restart']:
                 downtime = (now - service_health['zenarmor']['last_restart']).total_seconds()
                 service_health['zenarmor']['downtime_total'] += downtime
@@ -2611,51 +2680,56 @@ while True:
         
         current_sur = get_service_status('suricata')
         if "DOWN" in current_sur and "ACTIVE" in last_suricata_state:
-            # Track service downtime
             service_health['suricata']['last_restart'] = now
             service_health['suricata']['restart_count'] += 1
             insight = get_ai_analysis("IDS Service Failure", "Suricata stopped responding on the WAN interface.")
             weekly_stats['service_incidents'].append({'service': 'Suricata', 'time': now})
             send_grid_notification("🚨 SECURITY ALERT: Suricata is DOWN", dl="CRITICAL", pg="IDS Offline", ul="WAN exposed", gw="Immediate Action", extra_text=f"The WAN intrusion detection system is offline! AI Insight: {insight}", add_buttons="service_down")
         elif "ACTIVE" in current_sur and "DOWN" in last_suricata_state:
-            # Calculate downtime
             if service_health['suricata']['last_restart']:
                 downtime = (now - service_health['suricata']['last_restart']).total_seconds()
                 service_health['suricata']['downtime_total'] += downtime
             service_health['suricata']['uptime_start'] = now
             send_grid_notification("✅ Suricata Restored", "-", "-", "-", "IDS Online")
         last_suricata_state = current_sur
-        
+
         # Daily report - trigger between 7:00-7:05 AM
         if now.hour == 7 and now.minute < 5 and now.day != last_daily_report_day:
             print("    ⏰ 7:00 AM - Generating daily report...")
+            adguard_intel = get_adguard_stats()
+
+            # Send your Grid Notification
+            send_grid_notification( 
+                "📊 Daily Network Briefing", 
+                dl="AdGuard Home",  
+                pg="Active Defense",  
+                ul="System Healthy",  
+                gw="All Clear", 
+                extra_text=f"Good morning! Here is the 24-hour summary:\n\n{adguard_intel}", 
+                l1="Module", l2="Status", l3="Health", l4="Urgency" 
+            )
+
             send_daily_report()
-            
-            # Check for updates (firmware + packages)
+
+            last_daily_report_day = now.day
             updates_available = []
-            
-            # Check firmware updates
+
             fw = fetch_opn("core/firmware/status", "POST")
             if fw and fw.get('status') == 'updates':
                 updates_available.append("OPNsense firmware")
             
-            # Check package updates (includes os-sunnyvalley, os-sensei, etc.)
             pkg_data = fetch_opn("core/firmware/upgradestatus")
             if pkg_data:
-                # Check for package updates
                 if pkg_data.get('status') == 'update' or pkg_data.get('needs_reboot'):
                     updates_available.append("System packages")
                 
-                # Check specific packages
                 packages = pkg_data.get('packages', {})
                 if isinstance(packages, dict):
                     for pkg_name, pkg_info in packages.items():
                         if 'new_version' in pkg_info or pkg_info.get('needs_update'):
-                            # Prioritize Sunnyvalley/Sensei packages
                             if 'sensei' in pkg_name.lower() or 'sunny' in pkg_name.lower():
                                 updates_available.append(f"{pkg_name}")
             
-            # Send notification if any updates found
             if updates_available:
                 update_list = ", ".join(updates_available[:3])  # Show first 3
                 extra = f"Available: {update_list}"
@@ -2669,8 +2743,18 @@ while True:
         # Weekly report - trigger between 7:00-7:05 AM on Monday
         if now.weekday() == 0 and now.hour == 7 and now.minute < 5 and now.isocalendar()[1] != last_weekly_report_week:
             print("    📅 Monday 7:00 AM - Generating weekly summary...")
+            weekly_intel = get_adguard_stats(period="weekly")
             send_weekly_report()
             last_weekly_report_week = now.isocalendar()[1]
             time.sleep(5)
     
+        # Monthly report - trigger at 7:00 AM on the 1st of the month
+        if now.day == 1 and now.hour == 7 and now.minute < 5 and now.month != last_monthly_report_month:
+            print(f"    🗓️ {now.strftime('%B')} 1st - Generating Monthly Executive Summary...")
+            
+            send_monthly_report() 
+            
+            last_monthly_report_month = now.month
+            print(f"✅ Monthly Report for {now.strftime('%B')} sent.")
+
     time.sleep(FAST_POLL)

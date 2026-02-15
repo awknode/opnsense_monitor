@@ -1,0 +1,6 @@
+.env
+restart.sh
+show_leases.sh
+speedtest_data
+debug_services.py
+monitor.py.bak

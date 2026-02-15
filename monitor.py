@@ -2083,7 +2083,11 @@ def check_dhcp_leases(is_startup=False):
 def send_daily_report():
     global historical_daily_stats
     print("📊 Generating daily traffic report...")
+    
+    # Get speed data
     speed = get_speedtest_data(retry=False)
+    
+    # Get today's stats
     today = datetime.now().strftime('%Y-%m-%d')
     today_stats = daily_bandwidth.get(today, {
         'wg_download': 0, 'wg_upload': 0, 'wg_sessions': 0,
@@ -2094,7 +2098,7 @@ def send_daily_report():
     wg_total_gb = today_stats['wg_download'] + today_stats['wg_upload']
     wan_total_gb = today_stats['wan_download'] + today_stats['wan_upload']
     
-    # Save today's stats to historical data for comparison
+    # Save today's stats to historical data
     historical_daily_stats.append({
         'date': today,
         'wan_total': wan_total_gb,
@@ -2102,7 +2106,8 @@ def send_daily_report():
         'wg_sessions': today_stats['wg_sessions']
     })
     
-    # Build report with separate WAN and WireGuard sections
+    # ← ADD THIS SECTION (the missing report_text):
+    # Build main report text
     report_text = f"*📊 24-Hour Network Summary*\n\n"
     
     # WAN Traffic (Total Internet Usage)
@@ -2118,57 +2123,59 @@ def send_daily_report():
     report_text += f"• Upload: `{today_stats['wg_upload']:.2f} GB`\n"
     report_text += f"• Combined: `{wg_total_gb:.2f} GB`"
     
+    # High usage alert
     if wan_total_gb > DAILY_BANDWIDTH_ALERT_GB:
         report_text += f"\n\n⚠️ *HIGH USAGE ALERT*: WAN traffic exceeded {DAILY_BANDWIDTH_ALERT_GB} GB threshold!"
     
-heatmap = generate_usage_heatmap()
-historical = get_historical_comparison()
-smart_insights = detect_smart_patterns()
-top_talkers = get_top_talkers()
-zenarmor_insights = get_zenarmor_insights()
-app_breakdown = get_app_category_report()
-health_score = calculate_network_health_score()
-bandwidth_hogs = detect_bandwidth_hogs()
+    # Now generate the other sections
+    heatmap = generate_usage_heatmap()
+    historical = get_historical_comparison()
+    smart_insights = detect_smart_patterns()
+    top_talkers = get_top_talkers()
+    zenarmor_insights = get_zenarmor_insights()
+    app_breakdown = get_app_category_report()
+    health_score = calculate_network_health_score()
+    bandwidth_hogs = detect_bandwidth_hogs()
 
-report_blocks = [
-    {"type": "header", "text": {"type": "plain_text", "text": "📅 Daily Network Report"}},
-    {"type": "section", "text": {"type": "mrkdwn", "text": report_text}},
-    {"type": "divider"},
-    {"type": "section", "text": {"type": "mrkdwn", "text": historical}},
-    {"type": "divider"},
-    {"type": "section", "text": {"type": "mrkdwn", "text": smart_insights}},
-    {"type": "divider"},
-    {"type": "section", "text": {"type": "mrkdwn", "text": heatmap}},
-    {"type": "divider"},
-    {"type": "section", "text": {"type": "mrkdwn", "text": top_talkers}},
-    {"type": "divider"},
-    {"type": "section", "text": {"type": "mrkdwn", "text": zenarmor_insights}},
-    {"type": "divider"},
-    {"type": "section", "text": {"type": "mrkdwn", "text": health_score}},
-    {"type": "divider"},
-    {"type": "section", "text": {"type": "mrkdwn", "text": app_breakdown}},
-    {"type": "divider"},
-    {"type": "section", "fields": [
-        {"type": "mrkdwn", "text": f"*📥 Current Speed*\n`{speed['download']}`"},  # ← Fixed!
-        {"type": "mrkdwn", "text": f"*⏱️ Latency*\n`{speed['ping']}`"},             # ← Fixed!
-        {"type": "mrkdwn", "text": f"*📤 Upload Speed*\n`{speed['upload']}`"},       # ← Fixed!
-        {"type": "mrkdwn", "text": f"*📡 Active Devices*\n`{len([l for l in known_dhcp_leases.values() if l['active']])}`"}  # ← Fixed!
-    ]},
-    {"type": "context", "elements": [{"type": "mrkdwn", "text": f"Report generated at {datetime.now().strftime('%I:%M %p')}"}]}
-]
+    report_blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "📅 Daily Network Report"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": report_text}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": historical}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": smart_insights}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": heatmap}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": top_talkers}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": zenarmor_insights}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": health_score}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": app_breakdown}},
+        {"type": "divider"},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*📥 Current Speed*\n`{speed['download']}`"},  # ← Fixed!
+            {"type": "mrkdwn", "text": f"*⏱️ Latency*\n`{speed['ping']}`"},             # ← Fixed!
+            {"type": "mrkdwn", "text": f"*📤 Upload Speed*\n`{speed['upload']}`"},       # ← Fixed!
+            {"type": "mrkdwn", "text": f"*📡 Active Devices*\n`{len([l for l in known_dhcp_leases.values() if l['active']])}`"}  # ← Fixed!
+        ]},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"Report generated at {datetime.now().strftime('%I:%M %p')}"}]}
+    ]
 
-# Add action buttons
-report_blocks = add_action_buttons(report_blocks, context="general")
+    # Add action buttons
+    report_blocks = add_action_buttons(report_blocks, context="general")
 
-# Add bandwidth hogs if they exist
-if bandwidth_hogs:
-    report_blocks.append({"type": "divider"})
-    report_blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": bandwidth_hogs}})
+    # Add bandwidth hogs if they exist
+    if bandwidth_hogs:
+        report_blocks.append({"type": "divider"})
+        report_blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": bandwidth_hogs}})
 
-try:
-    requests.post(SLACK_WEBHOOK, json={"blocks": report_blocks}, timeout=10)
-except Exception as e:
-    print(f"❌ Failed to send daily report: {e}")
+    try:
+        requests.post(SLACK_WEBHOOK, json={"blocks": report_blocks}, timeout=10)
+    except Exception as e:
+        print(f"❌ Failed to send daily report: {e}")
 
 def send_weekly_report():
     global weekly_stats

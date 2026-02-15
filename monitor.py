@@ -20,13 +20,13 @@ load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Configuration ---
-OPNSENSE_URL = os.getenv("OPNSENSE_URL", "http://10.13.20.1")
+OPNSENSE_URL = os.getenv("OPNSENSE_URL", "http://10.1.1.1")
 API_KEY = os.getenv("OPN_API_KEY")
 API_SECRET = os.getenv("OPN_API_SECRET")
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
-SPEEDTEST_API = os.getenv("SPEEDTEST_API_URL", "http://10.13.20.8:8765/api/speedtest/latest")
+SPEEDTEST_API = os.getenv("SPEEDTEST_API_URL", "http://10.1.1.15:8765/api/speedtest/latest")
 AGH_USER = os.getenv("ADGUARD_USERNAME")
 AGH_PASS = os.getenv("ADGUARD_PASSWORD")
 AGH_URL = os.getenv("ADGUARD_URL")
@@ -115,9 +115,9 @@ blocked_devices = set()
 WATCHLIST_CONTAINERS = ["open-webui", "n8n", "homeassistant", "traefik", "sonarr", "radarr", "lidarr", "unpackarr", "flood", "rtorrent", "deluge", "prowlarr", "organizer,", "portainer"]
 
 HERO_WATCHLIST = {
-    "10.13.20.42": {"name": "The Bat WiFi", "emoji": "🏎️", "rank": "Legendary"},
-    "10.13.20.6": {"name": "Beast Server", "emoji": "🏰", "rank": "Critical"},
-    "10.13.20.8": {"name": "The Beast-Box", "emoji": "👹", "rank": "Core System", "description": "AI / Automation / Neural Hub"}
+    "10.1.1.42": {"name": "The Bat WiFi", "emoji": "🏎️", "rank": "Legendary"},
+    "10.1.1.6": {"name": "Beast Server", "emoji": "🏰", "rank": "Critical"},
+    "10.1.1.15": {"name": "The Beast-Box", "emoji": "👹", "rank": "Core System", "description": "AI / Automation / Neural Hub"}
 }
 
 # Historical comparison tracking (30 days of daily stats)
@@ -156,7 +156,7 @@ app_token = os.environ.get("SLACK_APP_TOKEN")
 
 """def trigger_manual_speedtest():
     try:
-        run_url = "http://10.13.20.8:8765/api/speedtest/run"
+        run_url = "http://10.1.1.15:8765/api/speedtest/run"
         print("⚡ Manual Speedtest: Triggering new scan...")
         requests.get(run_url, timeout=5)
         print("⏳ Speedtest in progress... waiting 40s.")
@@ -246,7 +246,7 @@ def handle_opnsense_command(text, channel_id, user_id):
             safe_reply(report)
 
         elif subcommand == 'watch' and len(parts) >= 3:
-            # Usage: /opnsense watch 10.13.20.50 Robin
+            # Usage: /opnsense watch 10.1.1.50 Robin
             new_ip = parts[1]
             new_name = " ".join(parts[2:])
             # Adds to the global HERO_WATCHLIST in memory
@@ -333,7 +333,7 @@ def handle_opnsense_command(text, channel_id, user_id):
             plex_text = "*📺 Plex Privacy Status*\n\n"
             
             # Your Plex server IP
-            plex_server_ip = "10.13.20.98"
+            plex_server_ip = "10.1.1.98"
             
             zen_status = fetch_opn("zenarmor/status")
             
@@ -434,7 +434,7 @@ def handle_opnsense_command(text, channel_id, user_id):
             # Method 2: Check Zenarmor top hosts (local streaming)
             zen_status = fetch_opn("zenarmor/status")
             if zen_status:
-                plex_server_ip = "10.13.20.98"
+                plex_server_ip = "10.1.1.98"
                 top_hosts = zen_status.get('top_local_hosts', {}).get('labels', [])
                 
                 if plex_server_ip in top_hosts:
@@ -471,13 +471,13 @@ def handle_opnsense_command(text, channel_id, user_id):
             """Show who's currently streaming via Plex API"""
             plex_text = "*📺 Plex Live Sessions*\n\n"
     
-            plex_url = "http://10.13.20.98:32400"
+            plex_url = "http://10.1.1.98:32400"
             plex_token = os.getenv("PLEX_TOKEN")  # You need to add this
     
             if not plex_token:
                 plex_text += "⚠️ *Plex Token Required*\n\n"
                 plex_text += "Get your token:\n"
-                plex_text += "1. Open Plex Web (http://10.13.20.98:32400/web)\n"
+                plex_text += "1. Open Plex Web (http://10.1.1.98:32400/web)\n"
                 plex_text += "2. Play any video\n"
                 plex_text += "3. Click ⋮ > Get Info > View XML\n"
                 plex_text += "4. Look for `X-Plex-Token=` in the URL\n"
@@ -580,7 +580,7 @@ def fetch_opn(path, method="GET", payload=None, fire_and_forget=False):
         return None
 
 def get_ai_analysis(event_type, details):
-    os.environ["OLLAMA_HOST"] = "http://10.13.20.8:11434"
+    os.environ["OLLAMA_HOST"] = "http://10.1.1.15:11434"
     prompt = (
         f"You are a Network Security Droid. Analyze this OPNsense event: {event_type}. "
         f"Details: {details}. Provide a 1-sentence tactical summary and a threat level (Low/Medium/High)."
@@ -1247,7 +1247,7 @@ def detect_smart_patterns():
             insights.append(f"🔄 *Service Instability*: {service.title()} has restarted {health['restart_count']} times")
     
     # 6. Plex privacy detection (movie watching telemetry)
-    plex_host = "10.13.20.98"
+    plex_host = "10.1.1.98"
     if plex_host in [l.get('ip') for l in known_dhcp_leases.values() if l.get('active')]:
         # Check for streaming activity using zenarmor/status
         try:

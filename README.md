@@ -331,12 +331,12 @@ DISCONNECT_CYCLE_WINDOW = 10
 ```
 🔐 WireGuard Connected: laptop-vpn
 
-📍 Location: Phoenix, United States
+📍 Location: Denver, United States
 🏢 ISP: Cox Communications
 🌐 IP Address: 45.23.156.89
 🛡️ Threat Level: Low ✅
 
-🕐 Timezone: America/Phoenix  |  Status: 📱 Mobile
+🕐 Timezone: America/Denver  |  Status: 📱 Mobile
 ```
 
 ### DHCP Leases
@@ -767,11 +767,11 @@ GET https://ifconfig.co/json?ip={ip_address}
 
 # Returns:
 {
-    'city': 'Phoenix',
-    'region_name': 'Arizona',
+    'city': 'Denver',
+    'region_name': 'Colorado',
     'country': 'United States',
     'country_iso': 'US',
-    'time_zone': 'America/Phoenix',
+    'time_zone': 'America/Denver',
     'asn_org': 'Cox Communications'
 }
 ```

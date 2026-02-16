@@ -8,6 +8,8 @@ import json
 import signal
 import ollama
 import threading
+import subprocess
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from dotenv import load_dotenv
@@ -26,7 +28,7 @@ API_SECRET = os.getenv("OPN_API_SECRET")
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
-SPEEDTEST_API = os.getenv("SPEEDTEST_API_URL", "http://10.1.1.15:8765/api/speedtest/latest")
+SPEEDTEST_API = os.getenv("SPEEDTEST_API_URL", "http://10.1.1.8:8765/api/speedtest/latest")
 AGH_USER = os.getenv("ADGUARD_USERNAME")
 AGH_PASS = os.getenv("ADGUARD_PASSWORD")
 AGH_URL = os.getenv("ADGUARD_URL")
@@ -59,6 +61,11 @@ connection_baseline = deque(maxlen=168)  # 7 days of hourly connection counts
 last_connection_alert_time = None
 last_bandwidth_hog_alert_time = None
 
+pihole_sessions = {
+    '10.1.1.69': {'sid': None, 'expires': datetime.now()},
+    '10.1.1.70': {'sid': None, 'expires': datetime.now()}
+}
+
 # while true
 loop_count = 0
 last_daily_report_day = None
@@ -76,6 +83,7 @@ baseline_speed = {'download': 0, 'upload': 0}
 wg_session_stats = {}
 wg_baselines = {} 
 wg_active_peers = set() # To stop spam: Tracks who is truly connected
+wg_peer_hourly_tracking = {}
 
 # Bandwidth tracking - now tracks BOTH total WAN traffic AND WireGuard separately
 daily_bandwidth = defaultdict(lambda: {
@@ -111,13 +119,14 @@ device_disconnect_history = defaultdict(lambda: deque(maxlen=20))
 wg_endpoint_history = defaultdict(list)
 wg_hourly_usage = defaultdict(lambda: defaultdict(float))
 blocked_devices = set()
+speed_history = deque(maxlen=168)
 
 WATCHLIST_CONTAINERS = ["open-webui", "n8n", "homeassistant", "traefik", "sonarr", "radarr", "lidarr", "unpackarr", "flood", "rtorrent", "deluge", "prowlarr", "organizer,", "portainer"]
 
 HERO_WATCHLIST = {
     "10.1.1.42": {"name": "The Bat WiFi", "emoji": "🏎️", "rank": "Legendary"},
     "10.1.1.6": {"name": "Beast Server", "emoji": "🏰", "rank": "Critical"},
-    "10.1.1.15": {"name": "The Beast-Box", "emoji": "👹", "rank": "Core System", "description": "AI / Automation / Neural Hub"}
+    "10.1.1.8": {"name": "The Beast-Box", "emoji": "👹", "rank": "Core System", "description": "AI / Automation / Neural Hub"}
 }
 
 # Historical comparison tracking (30 days of daily stats)
@@ -156,7 +165,7 @@ app_token = os.environ.get("SLACK_APP_TOKEN")
 
 """def trigger_manual_speedtest():
     try:
-        run_url = "http://10.1.1.15:8765/api/speedtest/run"
+        run_url = "http://10.1.1.8:8765/api/speedtest/run"
         print("⚡ Manual Speedtest: Triggering new scan...")
         requests.get(run_url, timeout=5)
         print("⏳ Speedtest in progress... waiting 40s.")
@@ -233,6 +242,12 @@ def handle_opnsense_command(text, channel_id, user_id):
             print(f"⚠️ Could not reply to slash command: {e}")
 
     try:
+        # For slow commands, acknowledge immediately
+        slow_commands = ['dns-top-domains', 'dns-blocked', 'firewall-stats', 'vpn-dashboard', 'containers', 'speed-history']
+        
+        if subcommand in slow_commands:
+            safe_reply(f"⏳ Processing `{subcommand}`...")
+        
         if subcommand == 'status':
             cmd_status_report()
         
@@ -242,7 +257,6 @@ def handle_opnsense_command(text, channel_id, user_id):
         
         elif subcommand == 'top-talkers' or subcommand == 'top':
             report = get_top_talkers()
-#            client.chat_postMessage(channel=channel_id, text=talkers)
             safe_reply(report)
 
         elif subcommand == 'watch' and len(parts) >= 3:
@@ -279,7 +293,6 @@ def handle_opnsense_command(text, channel_id, user_id):
                 fetch_opn("firewall/filter/apply", method="POST")
                 client.chat_postMessage(channel=channel_id, text=f"🚫 Blocked IP: `{ip}`")
             else:
-#                client.chat_postMessage(channel=channel_id, text=f"❌ Failed to block `{ip}` - ensure 'blocked_hosts' alias exists")
                 safe_reply(f"❌ Failed to block `{ip}` - ensure 'blocked_hosts' alias exists") 
 
         elif subcommand == 'unblock' and len(parts) >= 2:
@@ -293,27 +306,7 @@ def handle_opnsense_command(text, channel_id, user_id):
                 fetch_opn("firewall/filter/apply", method="POST")
                 client.chat_postMessage(channel=channel_id, text=f"✅ Unblocked IP: `{ip}`")
             else:
-#                client.chat_postMessage(channel=channel_id, text=f"❌ Failed to unblock `{ip}`")
                 safe_reply(f"❌ Failed to unblock `{ip}` - ensure 'blocked_hosts' alias exists")
-
-        elif subcommand == 'blocklist' or subcommand == 'blocked':
-            # Get blocked IPs from firewall alias
-            blocked_data = fetch_opn("firewall/alias/getItem/blocked_hosts")
-            if blocked_data and 'alias' in blocked_data:
-                addresses = blocked_data['alias'].get('content', '').split('\n')
-                addresses = [a.strip() for a in addresses if a.strip()]
-                if addresses:
-                    blocklist_text = "*🚫 Blocked IPs*\n```\n" + "\n".join(addresses) + "\n```"
-                else:
-                    blocklist_text = "*🚫 Blocked IPs*\n_No IPs currently blocked_"
-            else:
-                blocklist_text = "*🚫 Blocked IPs*\n_Blocklist alias not found_\n_Create 'blocked_hosts' alias in Firewall > Aliases_"
-#            client.chat_postMessage(channel=channel_id, text=blocklist_text)
-            safe_reply(blocklist_text)
-
-        elif subcommand == 'insights':
-            insights = detect_smart_patterns()
-            safe_reply(insights)
             
         elif subcommand == 'blocklist' or subcommand == 'blocked':
             # Get blocked IPs from firewall alias
@@ -328,6 +321,167 @@ def handle_opnsense_command(text, channel_id, user_id):
             else:
                 blocklist_text = "*🚫 Blocked IPs*\n_Blocklist alias not found_\n_Create 'blocked_hosts' alias in Firewall > Aliases_"
             safe_reply(blocklist_text)
+
+        elif subcommand == 'insights':
+            insights = detect_smart_patterns()
+            safe_reply(insights)
+
+        elif subcommand == 'dns-stats' or subcommand == 'dns':
+            """Show DNS protection stats from AdGuard and Pi-hole"""
+            dns_text = "*🛡️ DNS Protection Report*\n\n"
+            
+            total_queries = 0
+            total_blocked = 0
+            
+            # AdGuard Home stats
+            try:
+                response = requests.get(
+                    f"{AGH_URL}/control/stats",
+                    auth=(AGH_USER, AGH_PASS),
+                    timeout=5
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    adg_queries = data.get('num_dns_queries', 0)
+                    adg_blocked = data.get('num_blocked_filtering', 0)
+                    adg_rate = (adg_blocked / adg_queries * 100) if adg_queries > 0 else 0
+                    
+                    total_queries += adg_queries
+                    total_blocked += adg_blocked
+                    
+                    dns_text += f"*AdGuard Home (OPNsense)*\n"
+                    dns_text += f"• Queries: `{adg_queries:,}`\n"
+                    dns_text += f"• Blocked: `{adg_blocked:,}` ({adg_rate:.1f}%)\n\n"
+                else:
+                    dns_text += "*AdGuard Home*\n_Unavailable_\n\n"
+            except Exception as e:
+                dns_text += f"*AdGuard Home*\n_Error: {str(e)[:30]}_\n\n"
+            
+            # Pi-hole 1 stats (10.1.1.69)
+            try:
+                pihole1_sid = get_pihole_session("10.1.1.69")
+                
+                if pihole1_sid is not None:
+                    response = requests.get(
+                        "http://10.1.1.69/api/stats/summary",
+                        headers={"X-FTL-SID": pihole1_sid},
+                        timeout=5
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        queries_data = data.get('queries', {})
+                        pi1_queries = queries_data.get('total', 0)
+                        pi1_blocked = queries_data.get('blocked', 0)
+                        pi1_rate = (pi1_blocked / pi1_queries * 100) if pi1_queries > 0 else 0
+                        
+                        total_queries += pi1_queries
+                        total_blocked += pi1_blocked
+                        
+                        dns_text += f"*Pi-hole 1 (10.1.1.69)*\n"
+                        dns_text += f"• Queries: `{pi1_queries:,}`\n"
+                        dns_text += f"• Blocked: `{pi1_blocked:,}` ({pi1_rate:.1f}%)\n\n"
+                    else:
+                        dns_text += "*Pi-hole 1*\n_API Error_\n\n"
+                else:
+                    dns_text += "*Pi-hole 1*\n_Login Failed_\n\n"
+            except Exception as e:
+                dns_text += f"*Pi-hole 1*\n_Error: {str(e)[:30]}_\n\n"
+
+            # Pi-hole 2 stats (10.1.1.70)
+            try:
+                pihole2_sid = get_pihole_session("10.1.1.70")
+                
+                if pihole2_sid is not None:
+                    response = requests.get(
+                        "http://10.1.1.70/api/stats/summary",
+                        headers={"X-FTL-SID": pihole2_sid},
+                        timeout=5
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        queries_data = data.get('queries', {})
+                        pi2_queries = queries_data.get('total', 0)
+                        pi2_blocked = queries_data.get('blocked', 0)
+                        pi2_rate = (pi2_blocked / pi2_queries * 100) if pi2_queries > 0 else 0
+                        
+                        total_queries += pi2_queries
+                        total_blocked += pi2_blocked
+                        
+                        dns_text += f"*Pi-hole 2 (10.1.1.70)*\n"
+                        dns_text += f"• Queries: `{pi2_queries:,}`\n"
+                        dns_text += f"• Blocked: `{pi2_blocked:,}` ({pi2_rate:.1f}%)\n\n"
+                    else:
+                        dns_text += "*Pi-hole 2*\n_API Error_\n\n"
+                else:
+                    dns_text += "*Pi-hole 2*\n_Login Failed_\n\n"
+            except Exception as e:
+                dns_text += f"*Pi-hole 2*\n_Error: {str(e)[:30]}_\n\n"
+            
+            # Combined totals
+            if total_queries > 0:
+                total_rate = (total_blocked / total_queries * 100)
+                dns_text += f"*📊 Combined Total (24h)*\n"
+                dns_text += f"• Total Queries: `{total_queries:,}`\n"
+                dns_text += f"• Total Blocked: `{total_blocked:,}` ({total_rate:.1f}%)\n"
+                dns_text += f"• Protection Rate: {total_rate:.1f}%"
+            
+            safe_reply(dns_text)
+
+        elif subcommand == 'show-leases' or subcommand == 'leases':
+            """Show all active DHCP leases organized by subnet"""
+            # Get current lease data from tracked state
+            active_leases = {mac: lease for mac, lease in known_dhcp_leases.items() if lease['active']}
+            inactive_leases = {mac: lease for mac, lease in known_dhcp_leases.items() if not lease['active']}
+            
+            if not active_leases:
+                safe_reply("*📡 DHCP Leases*\n_No active leases found_")
+            else:
+                # Sort active leases by IP address
+                sorted_leases = sorted(active_leases.items(), key=lambda x: tuple(map(int, x[1]['ip'].split('.'))))
+                
+                # Group by subnet
+                from collections import defaultdict
+                subnet_groups = defaultdict(list)
+                
+                for mac, lease in sorted_leases:
+                    ip = lease['ip']
+                    subnet = '.'.join(ip.split('.')[:3]) + '.0/24'
+                    subnet_groups[subnet].append({
+                        'hostname': lease['hostname'],
+                        'ip': ip,
+                        'mac': mac
+                    })
+                
+                # Build response
+                response = f"*📡 DHCP Lease Report*\n\n"
+                response += f"🟢 Active: `{len(active_leases)}` | ⚪ Inactive: `{len(inactive_leases)}`\n\n"
+                
+                # Add each subnet
+                for subnet in sorted(subnet_groups.keys()):
+                    devices = subnet_groups[subnet]
+                    response += f"*{subnet}* ({len(devices)} devices)\n"
+                    
+                    for d in devices:
+                        # Format: IP - Hostname (truncate if too long)
+                        hostname = d['hostname']
+                        if len(hostname) > 25:
+                            hostname = hostname[:22] + '...'
+                        response += f"`{d['ip']:15}` {hostname}\n"
+                    
+                    response += "\n"
+                
+                # Add inactive summary if there are any
+                if inactive_leases:
+                    inactive_names = [lease['hostname'][:20] for lease in list(inactive_leases.values())[:5]]
+                    response += f"⚪ *Recently Inactive:* "
+                    response += ", ".join(inactive_names)
+                    if len(inactive_leases) > 5:
+                        response += f" +{len(inactive_leases)-5} more"
+                
+                safe_reply(response)
 
         elif subcommand == 'plex-privacy':
             plex_text = "*📺 Plex Privacy Status*\n\n"
@@ -375,105 +529,623 @@ def handle_opnsense_command(text, channel_id, user_id):
             
             safe_reply(plex_text)
 
-        elif subcommand == 'plex-status' or subcommand == 'plex':
-            """Real-time Plex streaming detection via WireGuard bandwidth"""
-            plex_text = "*📺 Plex Streaming Status*\n\n"
-            
-            # Method 1: Check WireGuard for heavy downloads (remote streaming)
-            data = fetch_opn("wireguard/service/show")
-            streaming_detected = False
-            
-            if data and 'rows' in data:
-                streaming_peers = []
+        elif subcommand == 'containers':
+            """Show Docker container health on Beast-Box"""
+            try:
+                # Run docker ps via SSH or direct API
+                # If Beast-Box has docker accessible, we can query it
+                result = subprocess.run(
+                    ['docker', 'ps', '-a', '--format', '{{.Names}}|{{.Status}}|{{.State}}'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
                 
-                for item in data['rows']:
-                    if not isinstance(item, dict) or item.get('type') != 'peer':
-                        continue
+                if result.returncode == 0:
+                    containers = result.stdout.strip().split('\n')
                     
-                    peer_name = item.get('name', 'Unknown')
-                    peer_id = f"{item.get('ifname', 'wg')}:{item.get('public-key', '')[:16]}"
+                    running = []
+                    stopped = []
                     
-                    # Check if active session with baseline
-                    if peer_id in wg_baselines:
+                    for container in containers:
+                        if not container:
+                            continue
+                        parts = container.split('|')
+                        if len(parts) >= 3:
+                            name = parts[0]
+                            status = parts[1]
+                            state = parts[2]
+                            
+                            if state == 'running':
+                                running.append(f"✅ `{name}` - {status}")
+                            else:
+                                stopped.append(f"❌ `{name}` - {status}")
+                    
+                    response = "*🐳 Docker Containers*\n\n"
+                    response += f"*Running: {len(running)}*\n"
+                    for c in running:
+                        response += f"{c}\n"
+                    
+                    if stopped:
+                        response += f"\n*Stopped: {len(stopped)}*\n"
+                        for c in stopped:
+                            response += f"{c}\n"
+                    
+                    safe_reply(response)
+                else:
+                    safe_reply("*🐳 Docker Containers*\n_Could not connect to Docker daemon_")
+            except Exception as e:
+                safe_reply(f"*🐳 Docker Containers*\n_Error: {str(e)[:100]}_")
+
+        elif subcommand == 'dns-top-domains' or subcommand == 'top-domains':
+            """Show most queried domains across all DNS servers"""
+            safe_reply("⏳ Fetching top domains...")
+            
+            dns_text = "*🌐 Top Queried Domains (24h)*\n\n"
+            
+            all_domains = {}
+            
+            # Get from Pi-hole 1 - use queries endpoint
+            try:
+                pihole1_sid = get_pihole_session("10.1.1.69")
+                if pihole1_sid is not None:
+                    response = requests.get(
+                        "http://10.1.1.69/api/queries",
+                        headers={"X-FTL-SID": pihole1_sid},
+                        params={"limit": 1000},  # Get last 1000 queries
+                        timeout=10
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        queries = data.get('queries', [])
+                        
+                        for query in queries:
+                            domain = query.get('domain', '')
+                            if domain:
+                                all_domains[domain] = all_domains.get(domain, 0) + 1
+            except Exception as e:
+                print(f"   ⚠️ Pi-hole 1 top domains error: {e}")
+            
+            # Get from Pi-hole 2
+            try:
+                pihole2_sid = get_pihole_session("10.1.1.70")
+                if pihole2_sid is not None:
+                    response = requests.get(
+                        "http://10.1.1.70/api/queries",
+                        headers={"X-FTL-SID": pihole2_sid},
+                        params={"limit": 1000},
+                        timeout=10
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        queries = data.get('queries', [])
+                        
+                        for query in queries:
+                            domain = query.get('domain', '')
+                            if domain:
+                                all_domains[domain] = all_domains.get(domain, 0) + 1
+            except Exception as e:
+                print(f"   ⚠️ Pi-hole 2 top domains error: {e}")
+            
+            if all_domains:
+                sorted_domains = sorted(all_domains.items(), key=lambda x: x[1], reverse=True)[:15]
+                
+                for i, (domain, count) in enumerate(sorted_domains, 1):
+                    dns_text += f"{i}. `{domain}`: {count:,} queries\n"
+            else:
+                dns_text += "_No domain data available from Pi-hole servers_"
+            
+            safe_reply(dns_text)
+
+        elif subcommand == 'dns-blocked' or subcommand == 'blocked-domains':
+            """Show most blocked domains across all DNS servers"""
+            safe_reply("⏳ Fetching blocked domains...")
+            
+            dns_text = "*🚫 Top Blocked Domains (24h)*\n\n"
+            
+            all_blocked = {}
+            
+            # Get from Pi-hole 1 - use queries endpoint with blocked filter
+            try:
+                pihole1_sid = get_pihole_session("10.1.1.69")
+                if pihole1_sid is not None:
+                    response = requests.get(
+                        "http://10.1.1.69/api/queries",
+                        headers={"X-FTL-SID": pihole1_sid},
+                        params={"blocked": "true", "limit": 1000},  # Only blocked queries
+                        timeout=10
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        queries = data.get('queries', [])
+                        
+                        for query in queries:
+                            domain = query.get('domain', '')
+                            if domain:
+                                all_blocked[domain] = all_blocked.get(domain, 0) + 1
+            except Exception as e:
+                print(f"   ⚠️ Pi-hole 1 blocked domains error: {e}")
+            
+            # Get from Pi-hole 2
+            try:
+                pihole2_sid = get_pihole_session("10.1.1.70")
+                if pihole2_sid is not None:
+                    response = requests.get(
+                        "http://10.1.1.70/api/queries",
+                        headers={"X-FTL-SID": pihole2_sid},
+                        params={"blocked": "true", "limit": 1000},
+                        timeout=10
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        queries = data.get('queries', [])
+                        
+                        for query in queries:
+                            domain = query.get('domain', '')
+                            if domain:
+                                all_blocked[domain] = all_blocked.get(domain, 0) + 1
+            except Exception as e:
+                print(f"   ⚠️ Pi-hole 2 blocked domains error: {e}")
+            
+            if all_blocked:
+                sorted_blocked = sorted(all_blocked.items(), key=lambda x: x[1], reverse=True)[:15]
+                
+                for i, (domain, count) in enumerate(sorted_blocked, 1):
+                    # Categorize threats
+                    if any(x in domain for x in ['doubleclick', 'googlesyndication', 'adservice']):
+                        emoji = "📢"  # Ads
+                    elif any(x in domain for x in ['tracker', 'analytics', 'telemetry']):
+                        emoji = "🔍"  # Tracking
+                    elif any(x in domain for x in ['malware', 'phishing', 'suspicious']):
+                        emoji = "⚠️"  # Malicious
+                    else:
+                        emoji = "🚫"  # Generic
+                    
+                    dns_text += f"{i}. {emoji} `{domain}`: {count:,} blocks\n"
+            else:
+                dns_text += "_No blocked domain data available from Pi-hole servers_"
+            
+            safe_reply(dns_text)
+
+        elif subcommand == 'firewall-stats' or subcommand == 'firewall':
+            """Show firewall rule statistics"""
+            fw_text = "*🔥 Firewall Statistics*\n\n"
+            
+            try:
+                # Get firewall logs
+                logs = fetch_opn("firewall/log_file/view")
+                
+                if logs and 'rows' in logs:
+                    blocked_ips = {}
+                    blocked_ports = {}
+                    rules_hit = {}
+                    
+                    for entry in logs['rows'][-500:]:  # Last 500 entries
+                        action = entry.get('action', '')
+                        src_ip = entry.get('src', 'unknown')
+                        dst_port = entry.get('dst_port', 'unknown')
+                        rule = entry.get('label', 'unknown')
+                        
+                        if action == 'block':
+                            blocked_ips[src_ip] = blocked_ips.get(src_ip, 0) + 1
+                            blocked_ports[dst_port] = blocked_ports.get(dst_port, 0) + 1
+                            rules_hit[rule] = rules_hit.get(rule, 0) + 1
+                    
+                    # Top blocked IPs
+                    if blocked_ips:
+                        fw_text += "*🚫 Top Blocked IPs*\n"
+                        for ip, count in sorted(blocked_ips.items(), key=lambda x: x[1], reverse=True)[:5]:
+                            fw_text += f"• `{ip}`: {count} attempts\n"
+                        fw_text += "\n"
+                    
+                    # Top targeted ports
+                    if blocked_ports:
+                        fw_text += "*🎯 Most Targeted Ports*\n"
+                        for port, count in sorted(blocked_ports.items(), key=lambda x: x[1], reverse=True)[:5]:
+                            port_name = {
+                                '22': 'SSH', '23': 'Telnet', '80': 'HTTP',
+                                '443': 'HTTPS', '3389': 'RDP', '445': 'SMB'
+                            }.get(str(port), f"Port {port}")
+                            fw_text += f"• {port_name}: {count} blocks\n"
+                        fw_text += "\n"
+                    
+                    # Most active rules
+                    if rules_hit:
+                        fw_text += "*📋 Most Active Rules*\n"
+                        for rule, count in sorted(rules_hit.items(), key=lambda x: x[1], reverse=True)[:5]:
+                            fw_text += f"• {rule}: {count} hits\n"
+                    
+                    if not blocked_ips and not blocked_ports:
+                        fw_text += "_No blocked connections in recent logs_"
+                else:
+                    fw_text += "_Firewall logs unavailable_"
+            except Exception as e:
+                fw_text += f"_Error: {str(e)[:100]}_"
+            
+            safe_reply(fw_text)
+
+        elif subcommand == 'vpn-dashboard' or subcommand == 'vpn':
+            """Show comprehensive VPN dashboard"""
+            vpn_text = "*🔐 WireGuard VPN Dashboard*\n\n"
+            
+            try:
+                data = fetch_opn("wireguard/service/show")
+                
+                if data and 'rows' in data:
+                    active_peers = []
+                    inactive_peers = []
+                    
+                    for item in data['rows']:
+                        if not isinstance(item, dict) or item.get('type') != 'peer':
+                            continue
+                        
+                        peer_name = item.get('name', 'Unknown')
+                        peer_id = f"{item.get('ifname', 'wg')}:{item.get('public-key', '')[:16]}"
+                        endpoint = item.get('endpoint', 'N/A')
+                        
+                        # Check handshake age
+                        raw_age = item.get('latest-handshake-age')
+                        age = int(raw_age) if raw_age is not None else 999999
+                        
+                        is_active = age < 180
+                        
+                        # Get bandwidth
                         rx_bytes = int(item.get('transfer-rx', 0))
                         tx_bytes = int(item.get('transfer-tx', 0))
-                        base = wg_baselines[peer_id]
                         
-                        # Calculate session bandwidth
-                        session_rx_gb = (rx_bytes - base['rx']) / (1024**3)
-                        session_tx_gb = (tx_bytes - base['tx']) / (1024**3)
+                        peer_info = {
+                            'name': peer_name,
+                            'endpoint': endpoint,
+                            'age': age,
+                            'rx_gb': rx_bytes / (1024**3),
+                            'tx_gb': tx_bytes / (1024**3),
+                            'total_gb': (rx_bytes + tx_bytes) / (1024**3)
+                        }
                         
-                        # If downloading >0.5 GB (likely streaming)
-                        if session_rx_gb > 0.5:
-                            streaming_peers.append({
-                                'name': peer_name,
-                                'download': session_rx_gb,
-                                'upload': session_tx_gb,
-                                'total': session_rx_gb + session_tx_gb
-                            })
-                            streaming_detected = True
-                
-                if streaming_peers:
-                    # Sort by download (highest first)
-                    streaming_peers.sort(key=lambda x: x['download'], reverse=True)
+                        # Get session bandwidth if baseline exists
+                        if peer_id in wg_baselines:
+                            base = wg_baselines[peer_id]
+                            session_rx = (rx_bytes - base['rx']) / (1024**3)
+                            session_tx = (tx_bytes - base['tx']) / (1024**3)
+                            peer_info['session_gb'] = session_rx + session_tx
+                        else:
+                            peer_info['session_gb'] = 0
+                        
+                        if is_active:
+                            active_peers.append(peer_info)
+                        else:
+                            inactive_peers.append(peer_info)
                     
-                    plex_text += "🎬 *STREAMING DETECTED (Remote)*\n\n"
-                    for peer in streaming_peers:
-                        plex_text += f"• `{peer['name']}`\n"
-                        plex_text += f"  ↓ {peer['download']:.2f} GB  ↑ {peer['upload']:.2f} GB\n"
-                    
-                    plex_text += "\n_Heavy VPN downloads indicate active streaming_"
-                else:
-                    plex_text += "📱 *VPN Status*\n"
-                    active_vpn = len([p for p in wg_active_peers])
-                    if active_vpn > 0:
-                        plex_text += f"{active_vpn} active connection(s), no heavy downloads\n\n"
+                    # Show active peers
+                    vpn_text += f"*🟢 Active Connections: {len(active_peers)}*\n"
+                    if active_peers:
+                        # Sort by session bandwidth
+                        active_peers.sort(key=lambda x: x['session_gb'], reverse=True)
+                        
+                        for peer in active_peers:
+                            location = peer['endpoint'].split(':')[0] if ':' in peer['endpoint'] else peer['endpoint']
+                            vpn_text += f"\n*{peer['name']}*\n"
+                            vpn_text += f"• Location: `{location}`\n"
+                            vpn_text += f"• Session: {peer['session_gb']:.2f} GB\n"
+                            vpn_text += f"• Total: {peer['total_gb']:.2f} GB\n"
+                            vpn_text += f"• Last seen: {peer['age']}s ago\n"
                     else:
-                        plex_text += "No active VPN connections\n\n"
-            
-            # Method 2: Check Zenarmor top hosts (local streaming)
-            zen_status = fetch_opn("zenarmor/status")
-            if zen_status:
-                plex_server_ip = "10.1.1.98"
-                top_hosts = zen_status.get('top_local_hosts', {}).get('labels', [])
-                
-                if plex_server_ip in top_hosts:
-                    plex_index = top_hosts.index(plex_server_ip)
-                    datasets = zen_status.get('top_local_hosts', {}).get('datasets', [])
+                        vpn_text += "_No active VPN connections_\n"
                     
-                    if datasets:
-                        data_values = datasets[0].get('data', [])
-                        if plex_index < len(data_values):
-                            plex_bytes = data_values[plex_index]
-                            plex_gb = plex_bytes / (1024**3)
+                    # Show inactive peers summary
+                    if inactive_peers:
+                        vpn_text += f"\n*⚪ Configured but Inactive: {len(inactive_peers)}*\n"
+                        for peer in inactive_peers[:3]:
+                            vpn_text += f"• {peer['name']} (idle)\n"
+                        
+                        if len(inactive_peers) > 3:
+                            vpn_text += f"• +{len(inactive_peers) - 3} more\n"
+                else:
+                    vpn_text += "_WireGuard data unavailable_"
+            except Exception as e:
+                vpn_text += f"_Error: {str(e)[:100]}_"
+            
+            safe_reply(vpn_text)
+
+        elif subcommand == 'speed-history' or subcommand == 'speeds':
+            """Show internet speed trends"""
+            speed_text = "*📊 Internet Speed History*\n\n"
+            
+            if len(speed_history) == 0:
+                speed_text += "_No speed test history yet_"
+                safe_reply(speed_text)
+                return
+            
+            # Calculate stats
+            downloads = [s['download'] for s in speed_history]
+            uploads = [s['upload'] for s in speed_history]
+            pings = [s['ping'] for s in speed_history]
+            
+            avg_down = sum(downloads) / len(downloads)
+            avg_up = sum(uploads) / len(uploads)
+            avg_ping = sum(pings) / len(pings)
+            
+            min_down = min(downloads)
+            max_down = max(downloads)
+            min_up = min(uploads)
+            max_up = max(uploads)
+            
+            speed_text += f"*📈 Download Speed*\n"
+            speed_text += f"• Average: `{avg_down:.1f} Mbps`\n"
+            speed_text += f"• Range: `{min_down:.1f} - {max_down:.1f} Mbps`\n"
+            speed_text += f"• Variance: `{((max_down - min_down) / avg_down * 100):.1f}%`\n\n"
+            
+            speed_text += f"*📤 Upload Speed*\n"
+            speed_text += f"• Average: `{avg_up:.1f} Mbps`\n"
+            speed_text += f"• Range: `{min_up:.1f} - {max_up:.1f} Mbps`\n\n"
+            
+            speed_text += f"*⏱️ Latency*\n"
+            speed_text += f"• Average: `{avg_ping:.1f} ms`\n\n"
+            
+            speed_text += f"*📊 Data Points*\n"
+            speed_text += f"• Tests recorded: {len(speed_history)}\n"
+            speed_text += f"• Oldest: {speed_history[0]['timestamp'].strftime('%b %d, %I:%M %p')}\n"
+            speed_text += f"• Newest: {speed_history[-1]['timestamp'].strftime('%b %d, %I:%M %p')}\n"
+            
+            # Recent trend
+            if len(speed_history) >= 10:
+                recent_5 = downloads[-5:]
+                older_5 = downloads[-10:-5]
+                trend_pct = ((sum(recent_5)/5 - sum(older_5)/5) / (sum(older_5)/5) * 100)
+                
+                if trend_pct > 5:
+                    speed_text += f"\n📈 *Trending up:* +{trend_pct:.1f}%"
+                elif trend_pct < -5:
+                    speed_text += f"\n📉 *Trending down:* {trend_pct:.1f}%"
+                else:
+                    speed_text += f"\n➡️ *Stable*"
+            
+            safe_reply(speed_text)       
+
+        elif subcommand == 'plex-dns' or subcommand == 'plex-telemetry':
+            plex_text = "*📺 Plex DNS Activity*\n\n"
+            
+            plex_domains = [
+                'metrics.plex.tv',
+                'plex.tv',
+                'tvdb2.plex.tv',
+                'meta.plex.tv',
+                'pubsub.plex.tv',
+                'analytics.plex.tv'
+            ]
+            
+            found_queries = []
+            
+            # AdGuard Home (unchanged)
+            try:
+                response = requests.get(
+                    "http://10.1.1.1:8080/control/querylog",
+                    auth=(os.getenv('ADGUARD_USER'), os.getenv('ADGUARD_PASS')),
+                    timeout=5
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    for entry in data.get('data', [])[:100]:
+                        domain = entry.get('question', {}).get('name', '')
+                        if any(plex_domain in domain for plex_domain in plex_domains):
+                            found_queries.append({
+                                'domain': domain,
+                                'source': 'AdGuard',
+                                'blocked': entry.get('reason') == 'FilteredBlackList'
+                            })
+            except Exception as e:
+                print(f"   ⚠️ AdGuard unavailable: {e}")
+            
+            # Pi-hole 1 (10.1.1.69) - v6 API
+            try:
+                # Get session ID (use stored one or login)
+                pihole1_sid = os.getenv('PIHOLE_SESSION_ID')
+                if not pihole1_sid and os.getenv('PIHOLE_PASSWORD'):
+                    pihole1_sid = get_pihole_session("10.1.1.69", os.getenv('PIHOLE_PASSWORD'))
+                
+                if pihole1_sid:
+                    response = requests.get(
+                        "http://10.1.1.69/api/queries",
+                        headers={"X-FTL-SID": pihole1_sid},
+                        params={"blocked": "true"},  # Only blocked queries
+                        timeout=5
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        queries = data.get('queries', [])
+                        
+                        for query in queries[:100]:  # Last 100 blocked queries
+                            domain = query.get('domain', '')
+                            if any(plex_domain in domain for plex_domain in plex_domains):
+                                found_queries.append({
+                                    'domain': domain,
+                                    'source': 'Pi-hole 1',
+                                    'blocked': True
+                                })
+            except Exception as e:
+                print(f"   ⚠️ Pi-hole 1 unavailable: {e}")
+            
+            # Pi-hole 2 (10.1.1.70) - v6 API
+            try:
+                pihole2_sid = os.getenv('PIHOLE_SESSION_ID')  # Use same session ID if same password
+                if not pihole2_sid and os.getenv('PIHOLE_PASSWORD'):
+                    pihole2_sid = get_pihole_session("10.1.1.70", os.getenv('PIHOLE_PASSWORD'))
+                
+                if pihole2_sid:
+                    response = requests.get(
+                        "http://10.1.1.70/api/queries",
+                        headers={"X-FTL-SID": pihole2_sid},
+                        params={"blocked": "true"},
+                        timeout=5
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        queries = data.get('queries', [])
+                        
+                        for query in queries[:100]:
+                            domain = query.get('domain', '')
+                            if any(plex_domain in domain for plex_domain in plex_domains):
+                                found_queries.append({
+                                    'domain': domain,
+                                    'source': 'Pi-hole 2',
+                                    'blocked': True
+                                })
+            except Exception as e:
+                print(f"   ⚠️ Pi-hole 2 unavailable: {e}")
+            
+            # Build response (unchanged)
+            if found_queries:
+                plex_text += f"🔴 *ACTIVE TELEMETRY DETECTED*\n\n"
+                plex_text += f"Found {len(found_queries)} Plex queries:\n\n"
+                
+                by_domain = {}
+                for q in found_queries:
+                    domain = q['domain']
+                    if domain not in by_domain:
+                        by_domain[domain] = {'count': 0, 'blocked': False}
+                    by_domain[domain]['count'] += 1
+                    if q['blocked']:
+                        by_domain[domain]['blocked'] = True
+                
+                for domain, info in list(by_domain.items())[:5]:
+                    status = "🚫 BLOCKED" if info['blocked'] else "✅ ALLOWED"
+                    plex_text += f"• `{domain}`: {info['count']} queries {status}\n"
+                
+                plex_text += f"\n*Privacy Impact:*\n"
+                plex_text += "• 📊 Viewing history tracked\n"
+                plex_text += "• ⭐ Watch progress synced\n"
+                plex_text += "• 🎬 Metadata requests\n"
+            else:
+                plex_text += "✅ *No Telemetry Detected*\n\n"
+                plex_text += "No Plex domains queried recently"
+            
+            safe_reply(plex_text)
+
+        elif subcommand == 'plex-status' or subcommand == 'plex':
+            plex_text = "*📺 Plex Streaming Status*\n\n"
+            
+            # Method 1: Check Plex API first (if token available)
+            plex_token = os.getenv("PLEX_TOKEN")
+            plex_url = os.getenv("PLEX_URL", "http://10.1.1.98:32400")
+            streaming_detected = False
+            
+            if plex_token:
+                try:
+                    response = requests.get(
+                        f"{plex_url}/status/sessions",
+                        headers={"X-Plex-Token": plex_token},
+                        timeout=5,
+                        verify=False
+                    )
+                    
+                    if response.status_code == 200:
+                        import xml.etree.ElementTree as ET
+                        root = ET.fromstring(response.content)
+                        sessions = root.findall('.//Video') + root.findall('.//Track')
+                        
+                        if sessions:
+                            plex_text += f"🎬 *{len(sessions)} Active Stream(s) (Plex API)*\n\n"
                             
-                            if not streaming_detected:
-                                plex_text += "\n🏠 *LOCAL STREAMING DETECTED*\n\n"
-                            else:
-                                plex_text += "\n📊 *Plex Server Activity*\n\n"
+                            for session in sessions:
+                                title = session.get('title', 'Unknown')
+                                user = session.find('.//User')
+                                username = user.get('title', 'Unknown') if user is not None else 'Unknown'
+                                player = session.find('.//Player')
+                                
+                                if player is not None:
+                                    device = player.get('device', 'Unknown')
+                                    local = player.get('local', '0') == '1'
+                                    location = "🏠 Local" if local else "🌍 Remote"
+                                else:
+                                    device = 'Unknown'
+                                    location = 'Unknown'
+                                
+                                plex_text += f"• `{username}` watching `{title}`\n"
+                                plex_text += f"  {location} on {device}\n"
                             
-                            plex_text += f"• Traffic: `{plex_gb:.2f} GB`\n"
-                            plex_text += f"• Rank: #{plex_index + 1} of {len(top_hosts)} hosts\n"
                             streaming_detected = True
+                            plex_text += "\n"
+                except Exception as e:
+                    plex_text += f"⚠️ Plex API check failed: {str(e)[:50]}\n\n"
+            
+            # Method 2: Check WireGuard for heavy downloads (remote streaming)
+            if not streaming_detected:
+                data = fetch_opn("wireguard/service/show")
+                
+                if data and 'rows' in data:
+                    streaming_peers = []
+                    
+                    for item in data['rows']:
+                        if not isinstance(item, dict) or item.get('type') != 'peer':
+                            continue
+                        
+                        peer_name = item.get('name', 'Unknown')
+                        peer_id = f"{item.get('ifname', 'wg')}:{item.get('public-key', '')[:16]}"
+                        
+                        # Check if active session with baseline
+                        if peer_id in wg_baselines:
+                            rx_bytes = int(item.get('transfer-rx', 0))
+                            tx_bytes = int(item.get('transfer-tx', 0))
+                            base = wg_baselines[peer_id]
+                            
+                            # Calculate session bandwidth
+                            session_rx_gb = (rx_bytes - base['rx']) / (1024**3)
+                            session_tx_gb = (tx_bytes - base['tx']) / (1024**3)
+                            
+                            # If downloading >0.5 GB (likely streaming)
+                            if session_rx_gb > 0.5:
+                                streaming_peers.append({
+                                    'name': peer_name,
+                                    'download': session_rx_gb,
+                                    'upload': session_tx_gb,
+                                    'total': session_rx_gb + session_tx_gb
+                                })
+                                streaming_detected = True
+                    
+                    if streaming_peers:
+                        # Sort by download (highest first)
+                        streaming_peers.sort(key=lambda x: x['download'], reverse=True)
+                        
+                        plex_text += "🎬 *STREAMING DETECTED (VPN Bandwidth)*\n\n"
+                        for peer in streaming_peers:
+                            plex_text += f"• `{peer['name']}`\n"
+                            plex_text += f"  ↓ {peer['download']:.2f} GB  ↑ {peer['upload']:.2f} GB\n"
+                        
+                        plex_text += "\n_Heavy VPN downloads indicate streaming_"
+                    else:
+                        plex_text += "📱 *VPN Status*\n"
+                        active_vpn = len([p for p in wg_active_peers])
+                        if active_vpn > 0:
+                            plex_text += f"{active_vpn} active connection(s), no heavy downloads\n\n"
+                        else:
+                            plex_text += "No active VPN connections\n\n"
             
             # If nothing detected
             if not streaming_detected:
                 plex_text += "✅ *No Streaming Detected*\n\n"
-                plex_text += "_Neither VPN bandwidth nor local traffic indicates active streaming_\n\n"
-                plex_text += "💡 *Reasons:*\n"
+                if not plex_token:
+                    plex_text += "💡 *Tip:* Add `PLEX_TOKEN` to .env for accurate local stream detection\n"
+                    plex_text += "Currently only detecting remote VPN streams\n\n"
+                plex_text += "*Possible reasons:*\n"
                 plex_text += "• No one is currently watching\n"
-                plex_text += "• Streaming locally on same subnet\n"
-                plex_text += "• Data hasn't updated yet (5-15 min delay)"
+                plex_text += "• Streaming locally (use `/opnsense plex-live`)\n"
+                plex_text += "• VPN bandwidth below threshold (0.5 GB)"
             
             safe_reply(plex_text)
 
         elif subcommand == 'plex-live':
-            """Show who's currently streaming via Plex API"""
             plex_text = "*📺 Plex Live Sessions*\n\n"
-    
-            plex_url = "http://10.1.1.98:32400"
-            plex_token = os.getenv("PLEX_TOKEN")  # You need to add this
-    
+            
+            plex_url = os.getenv("PLEX_URL", "http://10.1.1.98:32400")
+            plex_token = os.getenv("PLEX_TOKEN")
+            
             if not plex_token:
                 plex_text += "⚠️ *Plex Token Required*\n\n"
                 plex_text += "Get your token:\n"
@@ -482,56 +1154,164 @@ def handle_opnsense_command(text, channel_id, user_id):
                 plex_text += "3. Click ⋮ > Get Info > View XML\n"
                 plex_text += "4. Look for `X-Plex-Token=` in the URL\n"
                 plex_text += "5. Add to .env: `PLEX_TOKEN=your_token_here`"
-            else:
-                try:
-                    # Get active sessions
-                    response = requests.get(
-                        f"{plex_url}/status/sessions",
-                        headers={"X-Plex-Token": plex_token},
-                        timeout=5
-                    )
+                safe_reply(plex_text)
+                return
+            
+            try:
+                # Get active sessions
+                response = requests.get(
+                    f"{plex_url}/status/sessions",
+                    headers={"X-Plex-Token": plex_token},
+                    timeout=5,
+                    verify=False
+                )
+                
+                if response.status_code == 200:
+                    import xml.etree.ElementTree as ET
+                    root = ET.fromstring(response.content)
                     
-                    if response.status_code == 200:
-                        import xml.etree.ElementTree as ET
-                        root = ET.fromstring(response.content)
+                    sessions = root.findall('.//Video') + root.findall('.//Track')
+                    
+                    if sessions:
+                        plex_text += f"🎬 *{len(sessions)} Active Stream(s)*\n\n"
                         
-                        sessions = root.findall('.//Video') + root.findall('.//Track')
-                        
-                        if sessions:
-                            plex_text += f"🎬 *{len(sessions)} Active Stream(s)*\n\n"
+                        for idx, session in enumerate(sessions, 1):
+                            # Content info
+                            title = session.get('title', 'Unknown')
+                            content_type = session.get('type', 'unknown')
+                            year = session.get('year', '')
                             
-                            for session in sessions:
-                                title = session.get('title', 'Unknown')
-                                user = session.find('.//User')
-                                username = user.get('title', 'Unknown') if user is not None else 'Unknown'
-                                player = session.find('.//Player')
-                                device = player.get('device', 'Unknown') if player is not None else 'Unknown'
-                                
-                                plex_text += f"• *{username}* watching `{title}`\n"
-                                plex_text += f"  Device: {device}\n\n"
-                        else:
-                            plex_text += "✅ *No Active Streams*\n"
-                            plex_text += "Plex server is idle"
-                    else:
-                        plex_text += f"❌ Plex API Error: {response.status_code}"
+                            # User info
+                            user = session.find('.//User')
+                            username = user.get('title', 'Unknown') if user is not None else 'Unknown'
+                            
+                            # Player/Device info
+                            player = session.find('.//Player')
+                            if player is not None:
+                                device = player.get('device', 'Unknown')
+                                platform = player.get('platform', 'Unknown')
+                                product = player.get('product', 'Unknown')
+                                state = player.get('state', 'unknown')
+                                local = player.get('local', '0') == '1'
+                                ip_address = player.get('address', 'N/A')
+                            else:
+                                device = platform = product = 'Unknown'
+                                state = 'unknown'
+                                local = False
+                                ip_address = 'N/A'
+                            
+                            # Quality/Stream info
+                            media = session.find('.//Media')
+                            if media is not None:
+                                video_resolution = media.get('videoResolution', 'Unknown')
+                                bitrate = media.get('bitrate', '0')
+                                try:
+                                    bitrate_mbps = int(bitrate) / 1000 if bitrate != '0' else 0
+                                except:
+                                    bitrate_mbps = 0
+                            else:
+                                video_resolution = 'Unknown'
+                                bitrate_mbps = 0
+                            
+                            # Progress
+                            view_offset = int(session.get('viewOffset', 0)) / 1000  # ms to seconds
+                            duration = int(session.get('duration', 0)) / 1000
+                            progress_pct = (view_offset / duration * 100) if duration > 0 else 0
+                            
+                            # Build message
+                            plex_text += f"*Stream #{idx}*\n"
+                            plex_text += f"👤 User: `{username}`\n"
+                            plex_text += f"🎬 Title: `{title}`"
+                            if year:
+                                plex_text += f" ({year})"
+                            plex_text += f"\n"
+                            
+                            # Device & location
+                            location = "🏠 Local" if local else "🌍 Remote"
+                            state_emoji = "▶️" if state == "playing" else "⏸️" if state == "paused" else "⏹️"
+                            plex_text += f"📱 Device: {device} ({platform})\n"
+                            plex_text += f"📍 Location: {location}"
+                            if not local and ip_address != 'N/A':
+                                plex_text += f" (`{ip_address}`)"
+                            plex_text += f"\n"
+                            
+                            # Quality
+                            if video_resolution != 'Unknown':
+                                plex_text += f"📺 Quality: {video_resolution}"
+                                if bitrate_mbps > 0:
+                                    plex_text += f" @ {bitrate_mbps:.1f} Mbps"
+                                plex_text += "\n"
+                            
+                            # Progress
+                            plex_text += f"{state_emoji} Progress: {progress_pct:.0f}% "
+                            plex_text += f"({int(view_offset/60)}m / {int(duration/60)}m)\n\n"
                         
-                except Exception as e:
-                    plex_text += f"❌ Error: {str(e)[:100]}"
+                        # Summary stats
+                        local_streams = sum(1 for s in sessions if s.find('.//Player') is not None and s.find('.//Player').get('local', '0') == '1')
+                        remote_streams = len(sessions) - local_streams
+                        
+                        plex_text += "*📊 Summary*\n"
+                        plex_text += f"• Local: {local_streams} | Remote: {remote_streams}\n"
+                        
+                        # Bandwidth estimate
+                        total_bitrate = 0
+                        for s in sessions:
+                            media = s.find('.//Media')
+                            if media is not None:
+                                bitrate = media.get('bitrate', '0')
+                                try:
+                                    total_bitrate += int(bitrate) / 1000
+                                except:
+                                    pass
+                        
+                        if total_bitrate > 0:
+                            plex_text += f"• Est. Bandwidth: {total_bitrate:.1f} Mbps"
+                    else:
+                        plex_text += "✅ *No Active Streams*\n"
+                        plex_text += "Plex server is idle"
+                else:
+                    plex_text += f"❌ Plex API Error: {response.status_code}\n"
+                    plex_text += "Check PLEX_TOKEN and PLEX_URL in .env"
+                    
+            except Exception as e:
+                plex_text += f"❌ Error: {str(e)}"
             
             safe_reply(plex_text)
-        
+       
         else:
             help_text = """*🛠️ OPNsense Bot Commands*
 
+*📊 Status & Monitoring*
 `/opnsense status` - Full status report
 `/opnsense speedtest` - Run speed test
-`/opnsense top-talkers` - Show bandwidth users
-`/opnsense insights` - AI pattern analysis
+`/opnsense speed-history` - Internet speed trends
 `/opnsense network-health` - Overall health score
+
+*📡 Network Analysis*
+`/opnsense top-talkers` - Show bandwidth users
+`/opnsense show-leases` - List all active DHCP leases
+`/opnsense device <ip>` - Detailed device profile
 `/opnsense apps` - Application usage breakdown
 `/opnsense hogs` - Find bandwidth hogs
+
+*🛡️ Security & DNS*
+`/opnsense dns-stats` - DNS protection report (AdGuard + Pi-hole)
+`/opnsense dns-top-domains` - Most queried domains
+`/opnsense dns-blocked` - Most blocked domains
+`/opnsense firewall-stats` - Firewall analytics
+`/opnsense insights` - AI pattern analysis
+
+*🔐 VPN & Plex*
+`/opnsense vpn-dashboard` - WireGuard VPN status
 `/opnsense plex-status` - Real-time streaming detection
+`/opnsense plex-live` - Live Plex sessions (requires token)
 `/opnsense plex-privacy` - Check Plex telemetry
+`/opnsense plex-dns` - Plex in DNS logs
+
+*🐳 Infrastructure*
+`/opnsense containers` - Docker container health
+
+*🔧 Management*
 `/opnsense watch <ip> <name>` - Add a Hero Device
 `/opnsense block <ip>` - Block an IP address
 `/opnsense unblock <ip>` - Unblock an IP
@@ -580,7 +1360,7 @@ def fetch_opn(path, method="GET", payload=None, fire_and_forget=False):
         return None
 
 def get_ai_analysis(event_type, details):
-    os.environ["OLLAMA_HOST"] = "http://10.1.1.15:11434"
+    os.environ["OLLAMA_HOST"] = "http://10.1.1.8:11434"
     prompt = (
         f"You are a Network Security Droid. Analyze this OPNsense event: {event_type}. "
         f"Details: {details}. Provide a 1-sentence tactical summary and a threat level (Low/Medium/High)."
@@ -1418,6 +2198,122 @@ def get_adguard_stats():
     except Exception as e:
         return f"🛡️ AdGuard: Error connecting ({str(e)[:30]})"
 
+def get_pihole_session(host):
+    """Get Pi-hole v6 session token (cached with auto-refresh)"""
+    global pihole_sessions
+    
+    # Check if we have a valid cached session
+    now = datetime.now()
+    if host in pihole_sessions:
+        session = pihole_sessions[host]
+        if session.get('sid') is not None and session['expires'] > now:
+            return session['sid']
+    
+    # Login to get new session
+    password = os.getenv('PIHOLE_PASSWORD')
+    if not password:
+        return None
+    
+    try:
+        response = requests.post(
+            f"http://{host}/api/auth",
+            json={"password": password},
+            timeout=5
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            session_data = data.get('session', {})
+            sid = session_data.get('sid', '')
+            validity = session_data.get('validity', 300)
+            
+            # Cache session (even if sid is empty string)
+            pihole_sessions[host] = {
+                'sid': sid,
+                'expires': now + timedelta(seconds=validity - 30)
+            }
+            return sid
+    except:
+        pass
+    
+    return None
+
+def get_combined_dns_stats():
+    """Get stats from AdGuard + both Pi-holes (v6 API - FIXED)"""
+    try:
+        total_queries = 0
+        total_blocked = 0
+        servers_online = 0
+        
+        # AdGuard Home
+        try:
+            response = requests.get(
+                f"{AGH_URL}/control/stats",
+                auth=(AGH_USER, AGH_PASS),
+                timeout=5
+            )
+            if response.status_code == 200:
+                data = response.json()
+                total_queries += data.get('num_dns_queries', 0)
+                total_blocked += data.get('num_blocked_filtering', 0)
+                servers_online += 1
+        except:
+            pass
+        
+        # Pi-hole 1 (10.1.1.69) - v6 API CORRECT FIELDS
+        try:
+            pihole1_sid = get_pihole_session("10.1.1.69")
+            if pihole1_sid:
+                response = requests.get(
+                    "http://10.1.1.69/api/stats/summary",
+                    headers={"X-FTL-SID": pihole1_sid},
+                    timeout=5
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    queries_data = data.get('queries', {})
+                    pi1_queries = queries_data.get('total', 0)
+                    pi1_blocked = queries_data.get('blocked', 0)
+                    
+                    total_queries += pi1_queries
+                    total_blocked += pi1_blocked
+                    servers_online += 1
+        except:
+            pass
+        
+        # Pi-hole 2 (10.1.1.70) - v6 API CORRECT FIELDS
+        try:
+            pihole2_sid = get_pihole_session("10.1.1.70")
+            if pihole2_sid:
+                response = requests.get(
+                    "http://10.1.1.70/api/stats/summary",
+                    headers={"X-FTL-SID": pihole2_sid},
+                    timeout=5
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    queries_data = data.get('queries', {})
+                    pi2_queries = queries_data.get('total', 0)
+                    pi2_blocked = queries_data.get('blocked', 0)
+                    
+                    total_queries += pi2_queries
+                    total_blocked += pi2_blocked
+                    servers_online += 1
+        except:
+            pass
+        
+        rate = (total_blocked / total_queries * 100) if total_queries > 0 else 0
+        
+        return (
+            f"🛡️ *DNS Protection ({servers_online}/3 servers)*\n"
+            f"• Total Queries: `{total_queries:,}`\n"
+            f"• Threats Blocked: `{total_blocked:,}` ({rate:.1f}%)\n"
+        )
+    except Exception as e:
+        return f"🛡️ DNS Protection: Error ({str(e)[:30]})"
+
 def get_security_summary():
     """Generate security event summary for reports"""
     now = datetime.now()
@@ -1907,7 +2803,8 @@ def check_gateways(is_startup=False):
     return found
 
 def get_speedtest_data(retry=True, max_retries=5, require_fresh=False):
-    global baseline_speed
+    global baseline_speed, speed_history
+    
     for attempt in range(max_retries if retry else 1):
         try:
             response = requests.get(SPEEDTEST_API, timeout=10)
@@ -1915,6 +2812,7 @@ def get_speedtest_data(retry=True, max_retries=5, require_fresh=False):
             data = st.get('data', {})
             is_cached = False
             created_at = data.get('created_at') or data.get('updated_at')
+            
             if created_at:
                 try:
                     test_time = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
@@ -1930,21 +2828,36 @@ def get_speedtest_data(retry=True, max_retries=5, require_fresh=False):
                             continue
                 except Exception as e:
                     print(f"   ⚠️  Could not parse timestamp '{created_at}': {e}")
+            
             download = float(data.get('download', 0))
             ping = float(data.get('ping', 0))
             upload = float(data.get('upload', 0))
+            
+            # Set baseline speed if not set
             if baseline_speed['download'] == 0 and download > 0:
                 baseline_speed['download'] = download
                 baseline_speed['upload'] = upload
                 print(f"   📊 Baseline speed set: {download:.1f} Mbps down, {upload:.1f} Mbps up")
+            
             if download > 0 or upload > 0:
                 cache_label = " (cached)" if is_cached else ""
                 speed_warning = ""
                 download_ratio = 1.0
+                
                 if baseline_speed['download'] > 0:
                     download_ratio = download / baseline_speed['download']
                     if download_ratio < SPEED_DROP_THRESHOLD and not is_cached:
                         speed_warning = f" ⚠️ {int((1 - download_ratio) * 100)}% slower than baseline"
+                
+                # Add to speed history (only if not cached)
+                if not is_cached:
+                    speed_history.append({
+                        'timestamp': datetime.now(),
+                        'download': download,
+                        'upload': upload,
+                        'ping': ping
+                    })
+                
                 return {
                     'download': f"{download:.1f} Mbps{cache_label}{speed_warning}",
                     'ping': f"{ping:.1f} ms",
@@ -1959,7 +2872,16 @@ def get_speedtest_data(retry=True, max_retries=5, require_fresh=False):
         except Exception as e:
             if retry and attempt < max_retries - 1:
                 time.sleep(10)
-    return {'download': "-", 'ping': "-", 'upload': "-", 'is_cached': False, 'download_raw': 0, 'upload_raw': 0, 'degraded': False}
+    
+    return {
+        'download': "-",
+        'ping': "-",
+        'upload': "-",
+        'is_cached': False,
+        'download_raw': 0,
+        'upload_raw': 0,
+        'degraded': False
+    }
 
 def track_wan_traffic():
     """Track total WAN interface traffic"""
@@ -2019,7 +2941,9 @@ def track_wan_traffic():
         'tx': bytes_sent,
         'timestamp': datetime.now()
     }
-    print(f"   📊 WAN tracking: {daily_bandwidth[today]['wan_download']:.3f} GB down, {daily_bandwidth[today]['wan_upload']:.3f} GB up")
+
+    if loop_count % 10 == 0:
+        print(f"   📊 WAN tracking: {daily_bandwidth[today]['wan_download']:.3f} GB down, {daily_bandwidth[today]['wan_upload']:.3f} GB up")
 
 
 def check_wireguard_peers():
@@ -2114,7 +3038,15 @@ def check_wireguard_peers():
                     session_total_gb = session_rx_gb + session_tx_gb
                     
                     # Add to this hour's usage
-                    wg_hourly_usage[today_date][current_hour] = session_total_gb
+                    # wg_hourly_usage[today_date][current_hour] = session_total_gb
+
+                    if peer_id not in wg_peer_hourly_tracking:
+                        wg_peer_hourly_tracking[peer_id] = {'last_hour': current_hour, 'last_total': 0}
+
+                    if wg_peer_hourly_tracking[peer_id]['last_hour'] != current_hour:
+                        wg_hourly_usage[today_date][current_hour] += session_total_gb - wg_peer_hourly_tracking[peer_id]['last_total']
+                        wg_peer_hourly_tracking[peer_id]['last_hour'] = current_hour
+                        wg_peer_hourly_tracking[peer_id]['last_total'] = session_total_gb
 
         # --- DISCONNECTION DETECTED ---
         disconnected_peers = wg_active_peers - current_active_this_poll
@@ -2471,6 +3403,80 @@ def send_weekly_report():
     except Exception as e:
         print(f"❌ Failed to send weekly report: {e}")
 
+def send_monthly_report():
+    """Generate monthly executive summary"""
+    global historical_daily_stats
+    
+    try:
+        now = datetime.now()
+        month_name = now.strftime('%B')
+        
+        # Calculate monthly totals from historical_daily_stats (last 30 days)
+        if len(historical_daily_stats) == 0:
+            print("   ⚠️ No historical data for monthly report")
+            return
+        
+        # Sum up the last 30 days (or however many we have)
+        total_wan_gb = sum(d.get('wan_total', 0) for d in historical_daily_stats)
+        total_wg_gb = sum(d.get('wg_total', 0) for d in historical_daily_stats)
+        total_wg_sessions = sum(d.get('wg_sessions', 0) for d in historical_daily_stats)
+        days_tracked = len(historical_daily_stats)
+        
+        # Calculate averages
+        avg_wan_daily = total_wan_gb / days_tracked if days_tracked > 0 else 0
+        avg_wg_daily = total_wg_gb / days_tracked if days_tracked > 0 else 0
+        
+        # Get security summary from last 30 days
+        cutoff = now - timedelta(days=30)
+        suricata_30d = len([e for e in security_events['suricata_alerts'] if e['time'] > cutoff])
+        zenarmor_30d = sum([e['blocked'] for e in security_events['zenarmor_blocks'] if e['time'] > cutoff])
+        total_threats = suricata_30d + zenarmor_30d
+        
+        # Build report
+        report_text = f"*🗓️ {month_name} Executive Summary*\n\n"
+        report_text += f"*📊 Network Usage ({days_tracked} days)*\n"
+        report_text += f"• Total WAN: `{total_wan_gb:.2f} GB`\n"
+        report_text += f"• Total VPN: `{total_wg_gb:.2f} GB`\n"
+        report_text += f"• VPN Sessions: `{total_wg_sessions}`\n"
+        report_text += f"• Daily Avg: `{avg_wan_daily:.2f} GB`\n\n"
+        
+        report_text += f"*🛡️ Security Overview*\n"
+        report_text += f"• Threats Blocked: `{total_threats}`\n"
+        report_text += f"• Suricata Alerts: `{suricata_30d}`\n"
+        report_text += f"• Zenarmor Blocks: `{zenarmor_30d}`\n\n"
+        
+        # Service health for the month
+        report_text += f"*⚙️ System Health*\n"
+        for service in ['suricata', 'zenarmor', 'internet']:
+            health = service_health[service]
+            restarts = health['restart_count']
+            if service == 'internet':
+                report_text += f"• {service.title()}: {health['outage_count']} outages\n"
+            else:
+                report_text += f"• {service.title()}: {restarts} restarts\n"
+        
+        # Send notification
+        send_grid_notification(
+            f"🗓️ {month_name} Executive Summary",
+            dl=f"{total_wan_gb:.2f} GB Total",
+            pg=f"{total_threats} Threats",
+            ul=f"{days_tracked} Days Tracked",
+            gw="Infrastructure Stable",
+            extra_text=report_text,
+            l1="Data Usage", 
+            l2="Security", 
+            l3="Uptime", 
+            l4="Status"
+        )
+        
+        # DON'T clear daily_bandwidth - it's still needed for today!
+        # The deque automatically removes old entries when it reaches maxlen=30
+        
+        print(f"✅ Monthly report for {month_name} sent successfully")
+        
+    except Exception as e:
+        print(f"❌ Failed to generate monthly report: {e}")
+
 def send_system_notification(title, status, message, extra_text="", add_buttons=None):
     """
     Specialized notification for system-level events (internet outage, restarts, etc.)
@@ -2645,25 +3651,25 @@ while True:
 
         current_zen = get_service_status('zenarmor')
         threat_intel = get_zenarmor_threat_details()
-        adguard_intel = get_adguard_stats()
+        dns_intel = get_combined_dns_stats()
         is_actual_threat = threat_intel and "⚠️" in threat_intel
 
         if is_actual_threat:
             send_grid_notification( 
                 "🛡️ Network Defense Alert", 
-                dl="Zenarmor + Adguard",  
+                dl="Zenarmor + DNS",  
                 pg=f"{threat_intel.count('⚠️')} Active Threats",  
                 ul="Manual Review",  
                 gw="Action Required", 
                 extra_text=(
-                    f"{adguard_intel}\n" # Include AdGuard stats for context
+                    f"{dns_intel}\n" # Include AdGuard stats for context
                     f"🛑 *Security Threats Found:*\n{threat_intel}"
                 ), 
                 l1="Type", l2="Count", l3="Status", l4="Priority" 
             )
 
         else:
-            print(f"✅ Clean Sweep: {adguard_intel.strip()}")
+            print(f"✅ Clean Sweep: {dns_intel.strip()}")
                 
         if "DOWN" in current_zen and "ACTIVE" in last_zen_state:
             service_health['zenarmor']['last_restart'] = now
@@ -2696,7 +3702,7 @@ while True:
         # Daily report - trigger between 7:00-7:05 AM
         if now.hour == 7 and now.minute < 5 and now.day != last_daily_report_day:
             print("    ⏰ 7:00 AM - Generating daily report...")
-            adguard_intel = get_adguard_stats()
+            dns_summary = get_combined_dns_stats()
 
             # Send your Grid Notification
             send_grid_notification( 

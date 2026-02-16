@@ -77,6 +77,7 @@ last_monthly_report_month = None
 internet_is_up = True
 internet_outage_start = None
 last_internet_check = datetime.now()
+port_scan_tracking = defaultdict(lambda: {'ports': set(), 'last_seen': datetime.now()})
 
 # Bandwidth tracking
 baseline_speed = {'download': 0, 'upload': 0}
@@ -1982,6 +1983,34 @@ def get_top_talkers():
     
     return wg_text + wan_text
 
+def get_weekly_threat_summary():
+    """Summarize security threats for the week"""
+    threat_text = "*🛡️ Security Threats (7 Days)*\n\n"
+    
+    cutoff = datetime.now() - timedelta(days=7)
+    
+    # Suricata alerts
+    recent_suricata = [e for e in security_events['suricata_alerts'] if e['time'] > cutoff]
+    
+    # Zenarmor blocks
+    recent_zenarmor = [e for e in security_events['zenarmor_blocks'] if e['time'] > cutoff]
+    total_zen_blocks = sum(e['blocked'] for e in recent_zenarmor)
+    
+    threat_text += f"• IDS Alerts: {len(recent_suricata)}\n"
+    threat_text += f"• Blocked Threats: {total_zen_blocks}\n"
+    
+    if recent_suricata:
+        # Top threat types
+        threat_types = {}
+        for alert in recent_suricata:
+            sig = alert['signature'][:30]
+            threat_types[sig] = threat_types.get(sig, 0) + 1
+        
+        top_threat = max(threat_types.items(), key=lambda x: x[1])
+        threat_text += f"• Top Threat: {top_threat[0]} ({top_threat[1]}x)\n"
+    
+    return threat_text
+
 def detect_smart_patterns():
     """Detect patterns and generate intelligent insights"""
     global detected_anomalies
@@ -2073,6 +2102,74 @@ def detect_smart_patterns():
         return output
     else:
         return "*💡 Intelligent Insights*\n_All systems normal - no unusual patterns detected_"
+
+def detect_port_scan():
+    """Detect port scanning attempts"""
+    global port_scan_tracking
+    
+    try:
+        # Get firewall logs
+        logs = fetch_opn("firewall/log_file/view")
+        
+        if logs and 'rows' in logs:
+            now = datetime.now()
+            cutoff = now - timedelta(minutes=5)
+            
+            for entry in logs['rows'][-200:]:
+                action = entry.get('action', '')
+                src_ip = entry.get('src', '')
+                dst_port = entry.get('dst_port', '')
+                
+                if action == 'block' and src_ip and dst_port:
+                    # Track ports per IP
+                    if src_ip not in port_scan_tracking or port_scan_tracking[src_ip]['last_seen'] < cutoff:
+                        port_scan_tracking[src_ip] = {'ports': set(), 'last_seen': now}
+                    
+                    port_scan_tracking[src_ip]['ports'].add(dst_port)
+                    port_scan_tracking[src_ip]['last_seen'] = now
+            
+            # Check for scans (>10 different ports in 5 minutes)
+            for ip, data in list(port_scan_tracking.items()):
+                if data['last_seen'] > cutoff and len(data['ports']) >= 10:
+                    # Port scan detected!
+                    ip_info = get_ip_info(ip)
+                    
+                    alert_text = f"🚨 *Port Scan Detected*\n\n"
+                    alert_text += f"*Source IP:* `{ip}`\n"
+                    alert_text += f"*Location:* {ip_info['city']}, {ip_info['country']} {ip_info['country_flag']}\n"
+                    alert_text += f"*ISP:* {ip_info['isp']}\n"
+                    alert_text += f"*Ports Targeted:* {len(data['ports'])} different ports\n"
+                    alert_text += f"*Threat Level:* {ip_info['threat_level']}\n\n"
+                    alert_text += f"*Targeted Ports:*\n"
+                    
+                    # Show first 10 ports
+                    for port in list(data['ports'])[:10]:
+                        port_name = {
+                            '22': 'SSH', '23': 'Telnet', '80': 'HTTP',
+                            '443': 'HTTPS', '3389': 'RDP', '445': 'SMB',
+                            '3306': 'MySQL', '5432': 'PostgreSQL'
+                        }.get(str(port), f"Port {port}")
+                        alert_text += f"• {port_name}\n"
+                    
+                    if len(data['ports']) > 10:
+                        alert_text += f"• +{len(data['ports']) - 10} more\n"
+                    
+                    # Send alert
+                    send_grid_notification(
+                        "🚨 Port Scan Detected",
+                        dl=f"{ip_info['city']}, {ip_info['country']}",
+                        pg=f"{len(data['ports'])} Ports",
+                        ul=ip,
+                        gw="Active Scan",
+                        extra_text=alert_text,
+                        l1="Location", l2="Targets", l3="Source", l4="Status"
+                    )
+                    
+                    # Clear this IP so we don't spam
+                    del port_scan_tracking[ip]
+    
+    except Exception as e:
+        print(f"   ⚠️ Port scan detection error: {e}")
 
 def collect_security_events():
     """Collect and track security events from Suricata and Zenarmor"""
@@ -2942,7 +3039,9 @@ def track_wan_traffic():
         'timestamp': datetime.now()
     }
 
-    if loop_count % 10 == 0:
+    if loop_count % 60 == 0:
+        detect_port_scan()
+        today = datetime.now().strftime('%Y-%m-%d')
         print(f"   📊 WAN tracking: {daily_bandwidth[today]['wan_download']:.3f} GB down, {daily_bandwidth[today]['wan_upload']:.3f} GB up")
 
 
@@ -3369,6 +3468,8 @@ def send_weekly_report():
     security_report = get_security_summary()
     performance_sla = check_performance_sla()
 
+    threat_summary = get_weekly_threat_summary()
+
     report_blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": "📅 Weekly Network Summary"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": report_text}},
@@ -3380,6 +3481,8 @@ def send_weekly_report():
         {"type": "section", "text": {"type": "mrkdwn", "text": security_report}},
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text": performance_sla}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": threat_summary}},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": f"Next report: {(datetime.now() + timedelta(days=7)).strftime('%b %d, %Y')}"}]}
     ]
 

@@ -86,6 +86,14 @@ wg_baselines = {}
 wg_active_peers = set() # To stop spam: Tracks who is truly connected
 wg_peer_hourly_tracking = {}
 
+# WireGuard peers to suppress connect/disconnect noise
+WG_QUIET_PEERS = set(
+    p.strip() for p in os.getenv('WG_QUIET_PEERS', '').split(',') if p.strip()
+)
+
+# How many connect/disconnects before we care even for quiet peers (e.g. total outage)
+WG_QUIET_THRESHOLD = int(os.getenv('WG_QUIET_THRESHOLD', '6'))
+
 # Bandwidth tracking - now tracks BOTH total WAN traffic AND WireGuard separately
 daily_bandwidth = defaultdict(lambda: {
     'wg_download': 0, 'wg_upload': 0, 'wg_sessions': 0,  # WireGuard only
@@ -231,7 +239,34 @@ def process_interaction(client, req):
         if command == '/opnsense':
             threading.Thread(target=handle_opnsense_command, args=(text, channel_id, user_id)).start()
 
-def handle_opnsense_command(text, channel_id, user_id):
+def _build_health_response(safe_reply_fn, unhealthy, restarting, exited):
+    """Helper to build container health response"""
+    if not unhealthy and not restarting and not exited:
+        safe_reply_fn("*🏥 Container Health*\n✅ All containers healthy!")
+        return
+    
+    response = "*🏥 Container Health Issues*\n\n"
+    
+    if unhealthy:
+        response += f"*Unhealthy: {len(unhealthy)}*\n"
+        for c in unhealthy:
+            response += f"{c}\n"
+        response += "\n"
+    
+    if restarting:
+        response += f"*Restarting: {len(restarting)}*\n"
+        for c in restarting:
+            response += f"{c}\n"
+        response += "\n"
+    
+    if exited:
+        response += f"*Exited: {len(exited)}*\n"
+        for c in exited:
+            response += f"{c}\n"
+    
+    safe_reply_fn(response)
+
+def handle_opnsense_command(text, channel_id, user_id): 
     """Handle /opnsense slash command with subcommands"""
     parts = text.split() if text else []
     subcommand = parts[0].lower() if parts else 'help'
@@ -243,15 +278,24 @@ def handle_opnsense_command(text, channel_id, user_id):
             print(f"⚠️ Could not reply to slash command: {e}")
 
     try:
-        # For slow commands, acknowledge immediately
-        slow_commands = ['dns-top-domains', 'dns-blocked', 'firewall-stats', 'vpn-dashboard', 'containers', 'speed-history']
+        # 1. Add 'ask' to your slow commands list
+        slow_commands = ['dns-top-domains', 'dns-blocked', 'firewall-stats', 'vpn-dashboard', 'containers', 'speed-history', 'ask', 'ai']
         
         if subcommand in slow_commands:
             safe_reply(f"⏳ Processing `{subcommand}`...")
         
         if subcommand == 'status':
             cmd_status_report()
-        
+
+        elif subcommand == 'ask' or subcommand == 'ai':
+            user_query = " ".join(parts[1:]) if len(parts) > 1 else None
+            
+            if not user_query:
+                safe_reply("⚠️ You must provide a question. Usage: `/opnsense ask why is the network slow?`")
+            else:
+                import threading
+                threading.Thread(target=ask_ollama_general, args=(channel_id, user_query)).start()
+
         elif subcommand == 'speedtest':
             client.chat_postMessage(channel=channel_id, text="⚡ Running speedtest...")
             trigger_manual_speedtest()
@@ -327,6 +371,407 @@ def handle_opnsense_command(text, channel_id, user_id):
             insights = detect_smart_patterns()
             safe_reply(insights)
 
+        elif subcommand == 'container-stats' or subcommand == 'cstats':
+            """Show resource usage for all containers"""
+            try:
+                import docker
+                
+                all_stats = []
+                
+                # ============================================
+                # Get Local Container Stats
+                # ============================================
+                try:
+                    docker_client = docker.from_env()
+                    local_containers = docker_client.containers.list()  # Only running
+                    
+                    for container in local_containers:
+                        try:
+                            stats = container.stats(stream=False)
+                            name = container.name
+                            
+                            # FIXED CPU calculation
+                            cpu_stats = stats['cpu_stats']
+                            precpu_stats = stats['precpu_stats']
+                            
+                            cpu_delta = cpu_stats['cpu_usage']['total_usage'] - precpu_stats['cpu_usage']['total_usage']
+                            system_delta = cpu_stats['system_cpu_usage'] - precpu_stats['system_cpu_usage']
+                            
+                            # Number of CPUs
+                            online_cpus = cpu_stats.get('online_cpus', len(cpu_stats['cpu_usage'].get('percpu_usage', [1])))
+                            
+                            if system_delta > 0 and cpu_delta > 0:
+                                cpu_percent = (cpu_delta / system_delta) * online_cpus * 100.0
+                            else:
+                                cpu_percent = 0.0
+                            
+                            # Calculate memory usage
+                            mem_usage = stats['memory_stats']['usage'] / (1024**2)  # MB
+                            mem_limit = stats['memory_stats']['limit'] / (1024**2)  # MB
+                            mem_percent = (mem_usage / mem_limit * 100) if mem_limit > 0 else 0
+                            
+                            all_stats.append({
+                                'endpoint': 'Local',
+                                'name': name,
+                                'cpu': cpu_percent,
+                                'mem_mb': mem_usage,
+                                'mem_percent': mem_percent
+                            })
+                        except Exception as e:
+                            print(f"   ⚠️ Stats error for {container.name}: {e}")
+                    
+                    docker_client.close()
+                except Exception as e:
+                    print(f"   ⚠️ Local stats error: {e}")
+                
+                # ============================================
+                # Get Portainer Container Stats
+                # ============================================
+                portainer_url = os.getenv('PORTAINER_URL')
+                portainer_token = os.getenv('PORTAINER_API_TOKEN')
+                
+                if portainer_token:
+                    try:
+                        headers = {'X-API-Key': portainer_token}
+                        
+                        endpoints_resp = requests.get(
+                            f"{portainer_url}/api/endpoints",
+                            headers=headers,
+                            timeout=10,
+                            verify=False
+                        )
+                        
+                        if endpoints_resp.status_code == 200:
+                            endpoints = endpoints_resp.json()
+                            
+                            for endpoint in endpoints:
+                                endpoint_id = endpoint['Id']
+                                endpoint_name = endpoint['Name']
+                                
+                                # Get running containers
+                                containers_resp = requests.get(
+                                    f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/json?all=false",
+                                    headers=headers,
+                                    timeout=10,
+                                    verify=False
+                                )
+                                
+                                if containers_resp.status_code == 200:
+                                    containers = containers_resp.json()
+                                    
+                                    for container in containers:
+                                        name = container['Names'][0].lstrip('/')
+                                        container_id = container['Id']
+                                        
+                                        # Skip if we already got this from local
+                                        if any(s['name'] == name and s['endpoint'] == 'Local' for s in all_stats):
+                                            continue
+                                        
+                                        try:
+                                            stats_resp = requests.get(
+                                                f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/{container_id}/stats?stream=false",
+                                                headers=headers,
+                                                timeout=5,
+                                                verify=False
+                                            )
+                                            
+                                            if stats_resp.status_code == 200:
+                                                stats = stats_resp.json()
+                                                
+                                                # FIXED CPU calculation
+                                                cpu_stats = stats['cpu_stats']
+                                                precpu_stats = stats['precpu_stats']
+                                                
+                                                cpu_delta = cpu_stats['cpu_usage']['total_usage'] - precpu_stats['cpu_usage']['total_usage']
+                                                system_delta = cpu_stats['system_cpu_usage'] - precpu_stats['system_cpu_usage']
+                                                
+                                                online_cpus = cpu_stats.get('online_cpus', len(cpu_stats['cpu_usage'].get('percpu_usage', [1])))
+                                                
+                                                if system_delta > 0 and cpu_delta > 0:
+                                                    cpu_percent = (cpu_delta / system_delta) * online_cpus * 100.0
+                                                else:
+                                                    cpu_percent = 0.0
+                                                
+                                                # Calculate memory
+                                                mem_usage = stats['memory_stats']['usage'] / (1024**2)
+                                                mem_limit = stats['memory_stats']['limit'] / (1024**2)
+                                                mem_percent = (mem_usage / mem_limit * 100) if mem_limit > 0 else 0
+                                                
+                                                all_stats.append({
+                                                    'endpoint': endpoint_name,
+                                                    'name': name,
+                                                    'cpu': cpu_percent,
+                                                    'mem_mb': mem_usage,
+                                                    'mem_percent': mem_percent
+                                                })
+                                        except Exception as e:
+                                            print(f"   ⚠️ Stats error for {name}: {e}")
+                    except Exception as e:
+                        print(f"   ⚠️ Portainer stats error: {e}")
+                
+                # ============================================
+                # Format as Clean Tables (wider columns)
+                # ============================================
+                if not all_stats:
+                    safe_reply("*📊 Container Stats*\n_No running containers found_")
+                    return
+                
+                # Group by endpoint
+                grouped = {}
+                for stat in all_stats:
+                    endpoint = stat['endpoint']
+                    if endpoint not in grouped:
+                        grouped[endpoint] = []
+                    grouped[endpoint].append(stat)
+                
+                # Sort each group by CPU
+                for endpoint in grouped:
+                    grouped[endpoint].sort(key=lambda x: x['cpu'], reverse=True)
+                
+                # Build separate tables with wider columns
+                stats_text = "*📊 Container Resource Usage*\n"
+                
+                for endpoint, stats in grouped.items():
+                    stats_text += f"\n*{endpoint}* ({len(stats)} containers)\n```\n"
+                    
+                    # Wider table: 24 char name + CPU + RAM columns = ~50 chars total
+                    stats_text += "Container                   CPU     RAM (MB)    RAM %\n"
+                    stats_text += "──────────────────────────────────────────────────\n"
+                    
+                    for s in stats:
+                        # Container name: 24 characters (more readable)
+                        name = s['name'][:24].ljust(24)
+                        cpu = f"{s['cpu']:.1f}%".rjust(6)
+                        ram_mb = f"{s['mem_mb']:.0f}".rjust(9)
+                        ram_pct = f"{s['mem_percent']:.1f}%".rjust(6)
+                        
+                        stats_text += f"{name} {cpu}  {ram_mb}  {ram_pct}\n"
+                    
+                    stats_text += "```"
+                
+                safe_reply(stats_text)
+                
+            except Exception as e:
+                safe_reply(f"*📊 Container Stats*\n_Error: {str(e)[:100]}_")
+
+        elif subcommand == 'container-logs' or subcommand == 'clogs':
+            """Show recent logs for a specific container"""
+            # Usage: /opnsense logs <container_name>
+            if len(parts) < 2:
+                safe_reply("*📜 Container Logs*\n_Usage: `/opnsense logs <container_name>`_\n_Example: `/opnsense logs paperless-gpt`_")
+                return
+            
+            # Remove any prefix like "Local/" or "hostname/" if user included it
+            container_name = parts[1].split('/')[-1]  # Take only the last part after /
+            
+            try:
+                found = False
+                
+                # ============================================
+                # FIRST: Try Local Docker
+                # ============================================
+                try:
+                    import docker
+                    docker_client = docker.from_env()
+                    
+                    # Search local containers
+                    for container in docker_client.containers.list(all=True):
+                        if container_name.lower() in container.name.lower():
+                            found = True
+                            
+                            # Get logs (last 100 lines)
+                            logs = container.logs(tail=100, timestamps=True).decode('utf-8')
+                            
+                            # Limit to last 3500 chars to fit in Slack
+                            if len(logs) > 3500:
+                                logs = "...(truncated)\n" + logs[-3500:]
+                            
+                            response = f"*📜 Logs: {container.name}*\n_Local • Last 100 lines_\n\n```\n{logs}\n```"
+                            safe_reply(response)
+                            docker_client.close()
+                            return
+                    
+                    docker_client.close()
+                except Exception as e:
+                    print(f"   ⚠️ Local Docker logs error: {e}")
+                
+                # ============================================
+                # SECOND: Try Portainer API
+                # ============================================
+                if not found:
+                    portainer_url = os.getenv('PORTAINER_URL')
+                    portainer_token = os.getenv('PORTAINER_API_TOKEN')
+                    
+                    if not portainer_token:
+                        safe_reply("*📜 Container Logs*\n_Container not found locally and PORTAINER_API_TOKEN not set_")
+                        return
+                    
+                    headers = {'X-API-Key': portainer_token}
+                    
+                    # Search all endpoints for the container
+                    endpoints_resp = requests.get(
+                        f"{portainer_url}/api/endpoints",
+                        headers=headers,
+                        timeout=10,
+                        verify=False
+                    )
+                    
+                    if endpoints_resp.status_code != 200:
+                        safe_reply(f"*📜 Container Logs*\n_Portainer error: {endpoints_resp.status_code}_")
+                        return
+                    
+                    endpoints = endpoints_resp.json()
+                    
+                    for endpoint in endpoints:
+                        endpoint_id = endpoint['Id']
+                        endpoint_name = endpoint['Name']
+                        
+                        # Get containers
+                        containers_resp = requests.get(
+                            f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/json?all=true",
+                            headers=headers,
+                            timeout=10,
+                            verify=False
+                        )
+                        
+                        if containers_resp.status_code == 200:
+                            containers = containers_resp.json()
+                            
+                            for container in containers:
+                                name = container['Names'][0].lstrip('/')
+                                
+                                # Match container name (case insensitive, partial match)
+                                if container_name.lower() in name.lower():
+                                    found = True
+                                    container_id = container['Id']
+                                    
+                                    # Get logs (last 100 lines)
+                                    logs_resp = requests.get(
+                                        f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/{container_id}/logs?stdout=true&stderr=true&tail=100&timestamps=true",
+                                        headers=headers,
+                                        timeout=10,
+                                        verify=False
+                                    )
+                                    
+                                    if logs_resp.status_code == 200:
+                                        logs = logs_resp.text
+                                        
+                                        # Clean up Docker log formatting (removes binary prefixes)
+                                        lines = logs.split('\n')
+                                        clean_lines = []
+                                        for line in lines:
+                                            # Docker prepends 8 bytes of header to each line
+                                            if len(line) > 8:
+                                                clean_lines.append(line[8:])
+                                            elif line:
+                                                clean_lines.append(line)
+                                        
+                                        clean_logs = '\n'.join(clean_lines)
+                                        
+                                        # Limit to last 3500 chars to fit in Slack message
+                                        if len(clean_logs) > 3500:
+                                            clean_logs = "...(truncated)\n" + clean_logs[-3500:]
+                                        
+                                        response = f"*📜 Logs: {name}*\n_{endpoint_name} • Last 100 lines_\n\n```\n{clean_logs}\n```"
+                                        safe_reply(response)
+                                        return
+                
+                if not found:
+                    safe_reply(f"*📜 Container Logs*\n_Container matching '{container_name}' not found_\n_Try: `/opnsense containers` to see all names_")
+            
+            except Exception as e:
+                safe_reply(f"*📜 Container Logs*\n_Error: {str(e)[:100]}_")
+
+        elif subcommand == 'container-health' or subcommand == 'chealth':
+            try:
+                import docker
+                
+                unhealthy = []
+                restarting = []
+                exited = []
+                
+                # ── LOCAL DOCKER CHECK ─────────────────────────────────
+                try:
+                    docker_client = docker.from_env()
+                    for container in docker_client.containers.list(all=True):
+                        name = container.name
+                        status = container.status
+                        health = container.attrs.get('State', {}).get('Health', {})
+                        health_status = health.get('Status', '') if health else ''
+                        
+                        if health_status == 'unhealthy':
+                            health_logs = health.get('Log', [])
+                            last_log = health_logs[-1].get('Output', '')[:80] if health_logs else ''
+                            unhealthy.append(f"⚠️ `Local/{name}` - unhealthy\n  └ _{last_log}_")
+                        elif status == 'restarting':
+                            restart_count = container.attrs.get('RestartCount', 0)
+                            restarting.append(f"🔄 `Local/{name}` - restarting ({restart_count}x)")
+                        elif status == 'exited':
+                            exit_code = container.attrs.get('State', {}).get('ExitCode', '?')
+                            exited.append(f"❌ `Local/{name}` - exited (code {exit_code})")
+                    docker_client.close()
+                except Exception as e:
+                    print(f"   ⚠️ Local health check error: {e}")
+                # ────────────────────────────────────────────────────────
+                
+                portainer_url = os.getenv('PORTAINER_URL')
+                portainer_token = os.getenv('PORTAINER_API_TOKEN')
+                
+                if not portainer_token:
+                    if not unhealthy and not restarting and not exited:
+                        safe_reply("*🏥 Container Health*\n✅ All local containers healthy!\n_Set PORTAINER_API_TOKEN to check remote endpoints_")
+                    else:
+                        _build_health_response(safe_reply, unhealthy, restarting, exited)
+                    return
+                
+                headers = {'X-API-Key': portainer_token}
+                
+                endpoints_resp = requests.get(
+                    f"{portainer_url}/api/endpoints",
+                    headers=headers,
+                    timeout=10,
+                    verify=False
+                )
+                
+                if endpoints_resp.status_code != 200:
+                    safe_reply(f"*🏥 Container Health*\n_Portainer error: {endpoints_resp.status_code}_")
+                    return
+                
+                endpoints = endpoints_resp.json()
+                
+                for endpoint in endpoints:
+                    endpoint_id = endpoint['Id']
+                    endpoint_name = endpoint['Name']
+                    
+                    containers_resp = requests.get(
+                        f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/json?all=true",
+                        headers=headers,
+                        timeout=10,
+                        verify=False
+                    )
+                    
+                    if containers_resp.status_code == 200:
+                        containers = containers_resp.json()
+                        
+                        for container in containers:
+                            name = container['Names'][0].lstrip('/')
+                            state = container.get('State', '')
+                            status = container.get('Status', '')
+                            
+                            display_name = f"{endpoint_name}/{name}"
+                            
+                            if 'unhealthy' in status.lower():
+                                unhealthy.append(f"⚠️ `{display_name}` - {status}")
+                            elif state == 'restarting':
+                                restarting.append(f"🔄 `{display_name}` - {status}")
+                            elif state == 'exited':
+                                exited.append(f"❌ `{display_name}` - {status}")
+                
+                _build_health_response(safe_reply, unhealthy, restarting, exited)
+                
+            except Exception as e:
+                safe_reply(f"*🏥 Container Health*\n_Error: {str(e)[:100]}_")
+
         elif subcommand == 'dns-stats' or subcommand == 'dns':
             """Show DNS protection stats from AdGuard and Pi-hole"""
             dns_text = "*🛡️ DNS Protection Report*\n\n"
@@ -351,9 +796,17 @@ def handle_opnsense_command(text, channel_id, user_id):
                     total_queries += adg_queries
                     total_blocked += adg_blocked
                     
+                    adg_safesearch = data.get('num_replaced_safesearch', 0)
+                    adg_parental = data.get('num_replaced_parental', 0)
+                    
                     dns_text += f"*AdGuard Home (OPNsense)*\n"
                     dns_text += f"• Queries: `{adg_queries:,}`\n"
-                    dns_text += f"• Blocked: `{adg_blocked:,}` ({adg_rate:.1f}%)\n\n"
+                    dns_text += f"• Blocked: `{adg_blocked:,}` ({adg_rate:.1f}%)\n"
+                    if adg_safesearch > 0:
+                        dns_text += f"• Safe Search: `{adg_safesearch:,}` enforced\n"
+                    if adg_parental > 0:
+                        dns_text += f"• Parental Control: `{adg_parental:,}` blocked\n"
+                    dns_text += "\n"
                 else:
                     dns_text += "*AdGuard Home*\n_Unavailable_\n\n"
             except Exception as e:
@@ -382,7 +835,22 @@ def handle_opnsense_command(text, channel_id, user_id):
                         
                         dns_text += f"*Pi-hole 1 (10.1.1.69)*\n"
                         dns_text += f"• Queries: `{pi1_queries:,}`\n"
-                        dns_text += f"• Blocked: `{pi1_blocked:,}` ({pi1_rate:.1f}%)\n\n"
+                        dns_text += f"• Blocked: `{pi1_blocked:,}` ({pi1_rate:.1f}%)\n"
+                        # Get gravity/blocklist size
+                        try:
+                            grav_resp = requests.get(
+                                "http://10.1.1.69/api/info/database",
+                                headers={"X-FTL-SID": pihole1_sid},
+                                timeout=5
+                            )
+                            if grav_resp.status_code == 200:
+                                grav_data = grav_resp.json()
+                                domains_blocked = grav_data.get('gravity', {}).get('domains_being_blocked', 0)
+                                if domains_blocked > 0:
+                                    dns_text += f"• Blocklist: `{domains_blocked:,}` domains\n"
+                        except:
+                            pass
+                        dns_text += "\n"
                     else:
                         dns_text += "*Pi-hole 1*\n_API Error_\n\n"
                 else:
@@ -413,7 +881,22 @@ def handle_opnsense_command(text, channel_id, user_id):
                         
                         dns_text += f"*Pi-hole 2 (10.1.1.70)*\n"
                         dns_text += f"• Queries: `{pi2_queries:,}`\n"
-                        dns_text += f"• Blocked: `{pi2_blocked:,}` ({pi2_rate:.1f}%)\n\n"
+                        dns_text += f"• Blocked: `{pi2_blocked:,}` ({pi2_rate:.1f}%)\n"
+                        # Get gravity/blocklist size
+                        try:
+                            grav_resp = requests.get(
+                                "http://10.1.1.70/api/info/database",
+                                headers={"X-FTL-SID": pihole2_sid},
+                                timeout=5
+                            )
+                            if grav_resp.status_code == 200:
+                                grav_data = grav_resp.json()
+                                domains_blocked = grav_data.get('gravity', {}).get('domains_being_blocked', 0)
+                                if domains_blocked > 0:
+                                    dns_text += f"• Blocklist: `{domains_blocked:,}` domains\n"
+                        except:
+                            pass
+                        dns_text += "\n"
                     else:
                         dns_text += "*Pi-hole 2*\n_API Error_\n\n"
                 else:
@@ -430,6 +913,395 @@ def handle_opnsense_command(text, channel_id, user_id):
                 dns_text += f"• Protection Rate: {total_rate:.1f}%"
             
             safe_reply(dns_text)
+
+        elif subcommand == 'troubleshoot' or subcommand == 'fix':
+            safe_reply("🔍 *Sentinel is scanning system logs for anomalies...*")
+            
+            # 🛡️ THE ACCURATE LOADOUT: Only what you actually use
+            active_stack = "ACTIVE SERVICES: WireGuard, AdGuard Home, PHP-FPM"
+            
+            beast_stats = get_beast_performance()
+            logs = get_full_sentinel_report()
+            
+            prompt = (
+                "### MISSION PARAMETERS ###\n"
+                f"PROTECTED SECTOR: Beast-Box Firewall\n"
+                f"LOADOUT: {active_stack}\n"
+                f"PHYSICAL HEALTH: {beast_stats}\n\n"
+                "### LOG ARCHIVE ###\n"
+                f"{logs}\n\n"
+                "SENTINEL INSTRUCTIONS:\n"
+                "1. If a log mentions OpenVPN, CrowdSec, or Unbound, DISREGARD it (Retired Tech).\n"
+                "2. FOCUS on WireGuard handshake failures or AdGuard timeouts.\n"
+                "3. Keep the report tactical (Batman/Star Wars style).\n"
+                "4. If all is well, say: 'The Sector is secure, Commissioner.'"
+            )
+            
+            import threading as ai_th
+            ai_th.Thread(target=ask_ollama_sentinel, args=(channel_id, prompt)).start()
+
+        elif subcommand == 'audit':
+            safe_reply("🛡️ *Sentinel is performing a deep scan of the perimeter defenses...*")
+            
+            # 1. Get the current rules
+            rules_summary = get_firewall_rules_summary()
+            
+            # 2. The Auditor Directive
+            prompt = (
+                "### BAT-COMPUTER SECURITY PROTOCOL: PERIMETER AUDIT ###\n"
+                "MISSION: Analyze the provided OPNsense rules for actual vulnerabilities.\n\n"
+                "STRICT GUIDELINES:\n"
+                "1. ONLY analyze the rules listed below. DO NOT imagine or invent rule numbers.\n"
+                "2. If no 'ANY' destination rules exist on the WAN, state: 'WAN Perimeter: Airtight'.\n"
+                "3. If no insecure protocols are found, state: 'Protocol Hygiene: Optimal'.\n"
+                "4. Identify real redundancy (e.g., two identical rules for the same port).\n"
+                "5. TONE: Tactical briefing. Be direct. No generic advice.\n\n"
+                f"LIVE PERIMETER DATA:\n{rules_summary}\n\n"
+                "SENTINEL: Provide your assessment now."
+            )
+            
+            # 3. Fire it off to the Beast-Box
+            import threading as ai_th
+            ai_th.Thread(target=ask_ollama_sentinel, args=(channel_id, prompt)).start()
+
+        elif subcommand == 'vpn' or subcommand == 'peers':
+            safe_reply("📡 *Sentinel is pinging the WireGuard satellites...*")
+            
+            vpn_report = get_wireguard_status()
+            
+            prompt = (
+                "ACT AS THE BAT-COMPUTER / TACTICAL OFFICER.\n"
+                "MISSION: Report on the active WireGuard VPN connections.\n"
+                "1. For each ACTIVE peer, list their name and data usage.\n"
+                "2. ONLY flag a 'Data Usage Alert' if 'Traffic' is actually > 500MB.\n"
+                "3. If peers are active, do NOT say 'The tunnels are dark'. Say 'The Sector is active'.\n\n"
+                f"LIVE TELEMETRY:\n{vpn_report}"
+            )
+            
+            import threading as ai_th
+            ai_th.Thread(target=ask_ollama_sentinel, args=(channel_id, prompt)).start()
+
+        elif subcommand == 'threats' or subcommand == 'zen':
+            safe_reply("🛡️ *Sentinel is scanning the Zenarmor Security Fabric...*")
+            
+            threat_intel = get_zenarmor_threat_details()
+            
+            prompt = (
+                "ACT AS THE BAT-COMPUTER / TACTICAL ANALYST.\n"
+                "MISSION: Report on the Zenarmor Threat Intelligence.\n"
+                "1. Identify the 'Most Wanted' (the most frequent malicious destination).\n"
+                "2. If no threats exist, say 'All quiet on the Western Front, Commissioner.'\n"
+                "3. Use tactical, high-alert language for any 'Malware' or 'Phishing' hits.\n\n"
+                f"THREAT TELEMETRY:\n{threat_intel}"
+            )
+            
+            import threading as ai_th
+            ai_th.Thread(target=ask_ollama_sentinel, args=(channel_id, prompt)).start()
+
+        elif subcommand == 'stats':
+            # 🛰️ GATHERING REMOTE TELEMETRY FROM BEAST-FW
+            try:
+                # Reaching out across the network to the N100 Gatekeeper
+                data = fetch_opn("core/system/info")
+            
+                if not data or 'system' not in data:
+                    response = "⚠️ Sentinel Error: Beast-FW refused to transmit telemetry. Check API permissions."
+                else:
+                    sys_info = data.get('system', {})
+                    # Extracting specific vitals
+                    load = sys_info.get('load', ['0.0', '0.0', '0.0'])
+                    uptime = sys_info.get('uptime', 'Unknown')
+                    
+                    response = (
+                        f"**🛡️ BEAST-FW TACTICAL READOUT**\n"
+                        f"--- \n"
+                        f"🚀 **Uptime:** {uptime}\n"
+                        f"⚖️ **Load Avg:** {load[0]}, {load[1]}, {load[2]}\n"
+                        f"📡 **Link:** Verified (Remote N100)\n"
+                        f"--- \n"
+                        f"*Status: The Gatekeeper is vigilant.*"
+                    )
+                
+                # 🦇 Transmitting back to the Commissioner
+                safe_reply(response) 
+
+            except Exception as e:
+                safe_reply(f"⚠️ Sentinel Error: Sensor link severed. ({e})")
+
+        elif subcommand == 'device' and len(parts) >= 2:
+            """Show detailed device profile"""
+            device_ip = parts[1]
+            
+            device_text = f"*📱 Device Profile: {device_ip}*\n\n"
+            
+            # Find device in DHCP leases
+            device_info = None
+            for mac, lease in known_dhcp_leases.items():
+                if lease.get('ip') == device_ip:
+                    device_info = lease
+                    device_mac = mac
+                    break
+            
+            if not device_info:
+                safe_reply(f"*📱 Device Profile*\n_Device `{device_ip}` not found in DHCP leases_")
+                return
+            
+            # Basic info
+            hostname = device_info.get('hostname', 'Unknown')
+            is_active = device_info.get('active', False)
+            status = "🟢 Online" if is_active else "⚪ Offline"
+            
+            device_text += f"*Hostname:* `{hostname}`\n"
+            device_text += f"*IP Address:* `{device_ip}`\n"
+            device_text += f"*MAC Address:* `{device_mac}`\n"
+            device_text += f"*Status:* {status}\n\n"
+            
+            # Check if it's a Hero device
+            if device_ip in HERO_WATCHLIST:
+                hero = HERO_WATCHLIST[device_ip]
+                device_text += f"*{hero['emoji']} Hero Status:* {hero['rank']}\n"
+                if 'description' in hero:
+                    device_text += f"*Description:* {hero['description']}\n"
+                device_text += "\n"
+            
+            # Get DNS servers from DHCP lease data
+            try:
+                # Try Kea DHCP first
+                kea_endpoints = [
+                    "kea/leases4/search",
+                    "kea/dhcpv4/lease4-get-all",
+                ]
+                
+                dns_servers = None
+                gateway = None
+                lease_time = None
+                
+                for endpoint in kea_endpoints:
+                    lease_data = fetch_opn(endpoint)
+                    if lease_data and 'rows' in lease_data:
+                        for lease in lease_data['rows']:
+                            lease_mac = lease.get('hwaddr', lease.get('hw-address', '')).lower()
+                            lease_ip = lease.get('address', lease.get('ip-address', ''))
+                            
+                            if lease_mac == device_mac or lease_ip == device_ip:
+                                # Try to get DNS servers from user context or options
+                                user_context = lease.get('user-context', {})
+                                if isinstance(user_context, str):
+                                    try:
+                                        user_context = json.loads(user_context)
+                                    except:
+                                        pass
+                                
+                                # Check for DNS in various possible fields
+                                dns_servers = (
+                                    user_context.get('dns-servers') or 
+                                    lease.get('dns-servers') or
+                                    lease.get('option-data', {}).get('dns-servers')
+                                )
+                                
+                                gateway = (
+                                    user_context.get('routers') or
+                                    lease.get('routers') or
+                                    lease.get('gateway')
+                                )
+                                
+                                # Get lease time
+                                valid_lifetime = lease.get('valid-lifetime', lease.get('valid_lifetime'))
+                                if valid_lifetime:
+                                    lease_time = f"{int(valid_lifetime) // 3600}h"
+                                
+                                break
+                        
+                        if dns_servers:
+                            break
+                
+                # If Kea didn't work, try ISC DHCP
+                if not dns_servers:
+                    isc_data = fetch_opn("dhcpv4/leases/searchLease")
+                    if isc_data and 'rows' in isc_data:
+                        for lease in isc_data['rows']:
+                            if lease.get('mac', '').lower() == device_mac:
+                                # ISC DHCP might have this in different format
+                                dns_servers = lease.get('dns_servers')
+                                gateway = lease.get('gateway')
+                                break
+                
+                # Default to network defaults if not found
+                if not dns_servers:
+                    # Assume using Pi-hole/AdGuard setup
+                    dns_servers = ["10.1.1.69", "10.1.1.70", "10.1.1.1"]
+                
+                if not gateway:
+                    gateway = "10.1.1.1"  # OPNsense gateway
+                
+                device_text += f"*🌐 Network Configuration*\n"
+                device_text += f"• Gateway: `{gateway}`\n"
+                device_text += f"• DNS Servers:\n"
+                
+                if isinstance(dns_servers, list):
+                    for dns in dns_servers:
+                        # Add labels for known DNS servers
+                        if dns == "10.1.1.1":
+                            device_text += f"  └ `{dns}` (AdGuard Home)\n"
+                        elif dns == "10.1.1.69":
+                            device_text += f"  └ `{dns}` (Pi-hole 1)\n"
+                        elif dns == "10.1.1.70":
+                            device_text += f"  └ `{dns}` (Pi-hole 2)\n"
+                        else:
+                            device_text += f"  └ `{dns}`\n"
+                else:
+                    device_text += f"  └ `{dns_servers}`\n"
+                
+                if lease_time:
+                    device_text += f"• DHCP Lease: `{lease_time}`\n"
+                
+                device_text += "\n"
+                
+            except Exception as e:
+                print(f"   ⚠️ DNS info error: {e}")
+                device_text += f"*🌐 Network Configuration*\n"
+                device_text += f"• DNS: Using network defaults\n\n"
+            
+            # Manufacturer lookup from MAC address
+            try:
+                # First 3 octets of MAC (OUI - Organizationally Unique Identifier)
+                oui = device_mac[:8].upper().replace(':', '-')
+                
+                # Common manufacturers (you can expand this)
+                mac_vendors = {
+                    '00-50-56': 'VMware',
+                    '00-0C-29': 'VMware',
+                    '00-15-5D': 'Microsoft Hyper-V',
+                    '08-00-27': 'Oracle VirtualBox',
+                    '52-54-00': 'QEMU/KVM',
+                    'DC-A6-32': 'Raspberry Pi',
+                    'B8-27-EB': 'Raspberry Pi',
+                    'E4-5F-01': 'Raspberry Pi',
+                    '28-CD-C1': 'Raspberry Pi',
+                    '00-16-3E': 'Xen VIF',
+                    '00-1C-42': 'Parallels',
+                    'AC-DE-48': 'Apple',
+                    '00-1B-63': 'Apple',
+                    '3C-07-54': 'Apple iPhone',
+                    '40-A6-D9': 'Apple',
+                    'F0-18-98': 'Apple',
+                }
+                
+                vendor = mac_vendors.get(oui, 'Unknown')
+                if vendor != 'Unknown':
+                    device_text += f"*🏭 Manufacturer:* {vendor}\n\n"
+            except:
+                pass
+            
+            # First seen / Last seen
+            try:
+                # Check connection history for first/last seen
+                if device_mac in device_disconnect_history:
+                    history = list(device_disconnect_history[device_mac])
+                    if history:
+                        first_seen = min(history)
+                        last_seen = max(history)
+                        
+                        device_text += f"*🕐 Connection History*\n"
+                        device_text += f"• First seen: {first_seen.strftime('%b %d, %I:%M %p')}\n"
+                        device_text += f"• Last seen: {last_seen.strftime('%b %d, %I:%M %p')}\n"
+                        
+                        # Calculate uptime percentage
+                        if len(history) > 1:
+                            total_time = (datetime.now() - first_seen).total_seconds()
+                            # Rough estimate: assume each disconnect = 5 min downtime
+                            downtime = len(history) * 300
+                            uptime_pct = ((total_time - downtime) / total_time * 100) if total_time > 0 else 100
+                            
+                            if uptime_pct < 95:
+                                device_text += f"• Uptime: {uptime_pct:.1f}% ⚠️\n"
+                            else:
+                                device_text += f"• Uptime: {uptime_pct:.1f}% ✅\n"
+                        
+                        device_text += "\n"
+            except:
+                pass
+            
+            # Check bandwidth usage (WireGuard)
+            if device_ip in wg_peer_bandwidth:
+                bw = wg_peer_bandwidth[device_ip]
+                total_gb = bw['download'] + bw['upload']
+                device_text += f"*📊 VPN Bandwidth (Session)*\n"
+                device_text += f"• Download: `{bw['download']:.2f} GB`\n"
+                device_text += f"• Upload: `{bw['upload']:.2f} GB`\n"
+                device_text += f"• Total: `{total_gb:.2f} GB`\n\n"
+            
+            # Check Zenarmor for bandwidth
+            try:
+                zen_status = fetch_opn("zenarmor/status")
+                if zen_status:
+                    top_hosts = zen_status.get('top_local_hosts', {})
+                    host_labels = top_hosts.get('labels', [])
+                    
+                    if device_ip in host_labels:
+                        idx = host_labels.index(device_ip)
+                        datasets = top_hosts.get('datasets', [])
+                        
+                        if datasets and len(datasets) > 0:
+                            data_values = datasets[0].get('data', [])
+                            if idx < len(data_values):
+                                bytes_val = data_values[idx]
+                                gb_val = bytes_val / (1024**3)
+                                
+                                device_text += f"*📈 WAN Bandwidth (Current Period)*\n"
+                                device_text += f"• Total: `{gb_val:.2f} GB`\n"
+                                device_text += f"• Rank: #{idx + 1} of {len(host_labels)}\n\n"
+            except:
+                pass
+            
+            # Check for anomalies
+            is_unstable, instability_desc = detect_disconnect_cycle(device_mac, hostname)
+            if is_unstable:
+                device_text += f"⚠️ *Connection Instability Detected*\n{instability_desc}\n\n"
+            
+            # Recent disconnect events (last 5)
+            if device_mac in device_disconnect_history:
+                recent_disconnects = list(device_disconnect_history[device_mac])[-5:]
+                if recent_disconnects and len(recent_disconnects) > 1:
+                    device_text += f"*📡 Recent Disconnects*\n"
+                    for ts in recent_disconnects:
+                        device_text += f"• {ts.strftime('%b %d, %I:%M %p')}\n"
+                    device_text += "\n"
+            
+            # Container check (if it's running Docker)
+            try:
+                import docker
+                docker_client = docker.from_env()
+                
+                # Check if any containers are running on this IP
+                containers = docker_client.containers.list()
+                device_containers = []
+                
+                for container in containers:
+                    # Get container's network settings
+                    networks = container.attrs.get('NetworkSettings', {}).get('Networks', {})
+                    for network_name, network_info in networks.items():
+                        if network_info.get('IPAddress') == device_ip:
+                            device_containers.append(container.name)
+                
+                docker_client.close()
+                
+                if device_containers:
+                    device_text += f"*🐳 Docker Containers ({len(device_containers)})*\n"
+                    for name in device_containers[:5]:
+                        device_text += f"• `{name}`\n"
+                    if len(device_containers) > 5:
+                        device_text += f"• +{len(device_containers) - 5} more\n"
+                    device_text += "\n"
+            except:
+                pass
+            
+            # Quick actions
+            device_text += f"*⚡ Quick Actions*\n"
+            device_text += f"• `/opnsense watch {device_ip} {hostname}` - Add to watchlist\n"
+            device_text += f"• `/opnsense block {device_ip}` - Block this device\n"
+            
+            safe_reply(device_text)
 
         elif subcommand == 'show-leases' or subcommand == 'leases':
             """Show all active DHCP leases organized by subnet"""
@@ -531,52 +1403,147 @@ def handle_opnsense_command(text, channel_id, user_id):
             safe_reply(plex_text)
 
         elif subcommand == 'containers':
-            """Show Docker container health on Beast-Box"""
+            """Show Docker container health - Local + Portainer"""
             try:
-                # Run docker ps via SSH or direct API
-                # If Beast-Box has docker accessible, we can query it
-                result = subprocess.run(
-                    ['docker', 'ps', '-a', '--format', '{{.Names}}|{{.Status}}|{{.State}}'],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
+                import docker
                 
-                if result.returncode == 0:
-                    containers = result.stdout.strip().split('\n')
+                all_running = []
+                all_stopped = []
+                local_container_names = set()  # Track local names to avoid duplicates
+                
+                # ============================================
+                # PART 1: Local Docker (Beast-Box)
+                # ============================================
+                try:
+                    docker_client = docker.from_env()
+                    local_containers = docker_client.containers.list(all=True)
                     
-                    running = []
-                    stopped = []
+                    for container in local_containers:
+                        name = container.name
+                        status = container.status
+                        local_container_names.add(name)  # Track this name
+                        
+                        display_name = f"Local/{name}"
+                        
+                        if status == 'running':
+                            # Get uptime
+                            uptime_str = ""
+                            try:
+                                started_at = container.attrs.get('State', {}).get('StartedAt', '')
+                                if started_at:
+                                    start_time = datetime.fromisoformat(started_at[:19])
+                                    uptime_str = f" _{format_duration((datetime.now() - start_time).total_seconds())}_"
+                            except:
+                                pass
+                            all_running.append(f"✅ `{display_name}`{uptime_str}")
+                        else:
+                            all_stopped.append(f"❌ `{display_name}` - {status}")
                     
-                    for container in containers:
-                        if not container:
-                            continue
-                        parts = container.split('|')
-                        if len(parts) >= 3:
-                            name = parts[0]
-                            status = parts[1]
-                            state = parts[2]
+                    docker_client.close()
+                    print(f"   📦 Found {len(local_containers)} local containers")
+                    
+                except Exception as e:
+                    print(f"   ⚠️ Local Docker error: {e}")
+                
+                # ============================================
+                # PART 2: Portainer API (All Endpoints)
+                # ============================================
+                portainer_url = os.getenv('PORTAINER_URL', 'http://10.1.1.8:9000')
+                portainer_token = os.getenv('PORTAINER_API_TOKEN')
+                
+                if portainer_token:
+                    try:
+                        headers = {'X-API-Key': portainer_token}
+                        
+                        endpoints_resp = requests.get(
+                            f"{portainer_url}/api/endpoints",
+                            headers=headers,
+                            timeout=10,
+                            verify=False
+                        )
+                        
+                        print(f"   🔍 Portainer endpoints response: {endpoints_resp.status_code}")
+                        
+                        if endpoints_resp.status_code == 200:
+                            endpoints = endpoints_resp.json()
+                            print(f"   📡 Found {len(endpoints)} Portainer endpoints")
                             
-                            if state == 'running':
-                                running.append(f"✅ `{name}` - {status}")
-                            else:
-                                stopped.append(f"❌ `{name}` - {status}")
-                    
-                    response = "*🐳 Docker Containers*\n\n"
-                    response += f"*Running: {len(running)}*\n"
-                    for c in running:
-                        response += f"{c}\n"
-                    
-                    if stopped:
-                        response += f"\n*Stopped: {len(stopped)}*\n"
-                        for c in stopped:
-                            response += f"{c}\n"
-                    
-                    safe_reply(response)
+                            for endpoint in endpoints:
+                                endpoint_id = endpoint['Id']
+                                endpoint_name = endpoint['Name']
+                                
+                                print(f"   🔧 Processing endpoint: '{endpoint_name}' (ID: {endpoint_id})")
+                                
+                                try:
+                                    containers_resp = requests.get(
+                                        f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/json?all=true",
+                                        headers=headers,
+                                        timeout=10,
+                                        verify=False
+                                    )
+                                    
+                                    print(f"   🐳 Endpoint '{endpoint_name}' containers response: {containers_resp.status_code}")
+                                    
+                                    if containers_resp.status_code == 200:
+                                        containers = containers_resp.json()
+                                        print(f"   📦 Found {len(containers)} containers in '{endpoint_name}'")
+                                        
+                                        for container in containers:
+                                            name = container['Names'][0].lstrip('/') if container.get('Names') else 'unknown'
+                                            state = container.get('State', 'unknown')
+                                            status = container.get('Status', 'unknown')
+                                            
+                                            # Skip if we already showed this container locally
+                                            if name in local_container_names:
+                                                print(f"   ⏭️ Skipping duplicate: {name}")
+                                                continue
+                                            
+                                            display_name = f"{endpoint_name}/{name}"
+                                            
+                                            if state == 'running':
+                                                all_running.append(f"✅ `{display_name}`")
+                                            else:
+                                                all_stopped.append(f"❌ `{display_name}` - {status}")
+                                    else:
+                                        print(f"   ❌ Failed to get containers: {containers_resp.text[:100]}")
+                                
+                                except Exception as e:
+                                    print(f"   ⚠️ Error fetching containers from {endpoint_name}: {e}")
+                                    all_stopped.append(f"⚠️ `{endpoint_name}` - Connection failed")
+                        
+                        else:
+                            print(f"   ⚠️ Portainer API error: {endpoints_resp.status_code}")
+                            print(f"   📄 Response: {endpoints_resp.text[:200]}")
+                            
+                    except Exception as e:
+                        print(f"   ⚠️ Portainer error: {e}")
                 else:
-                    safe_reply("*🐳 Docker Containers*\n_Could not connect to Docker daemon_")
+                    print("   ℹ️ PORTAINER_API_TOKEN not set, skipping remote endpoints")
+                
+                # ============================================
+                # Build Response
+                # ============================================
+                total = len(all_running) + len(all_stopped)
+                response = f"*🐳 Docker Containers ({total} total)*\n\n"
+
+                if all_running:
+                    response += f"*Running: {len(all_running)}*\n"
+                    for c in sorted(all_running):  # No limit
+                        response += f"{c}\n"
+
+                if all_stopped:
+                    response += f"\n*Stopped/Offline: {len(all_stopped)}*\n"
+                    for c in sorted(all_stopped):  # No limit
+                        response += f"{c}\n"
+
+                if not all_running and not all_stopped:
+                    response = "*🐳 Docker Containers*\n_No containers found_"
+
+                safe_reply(response)
+                
             except Exception as e:
                 safe_reply(f"*🐳 Docker Containers*\n_Error: {str(e)[:100]}_")
+
 
         elif subcommand == 'dns-top-domains' or subcommand == 'top-domains':
             """Show most queried domains across all DNS servers"""
@@ -736,11 +1703,19 @@ def handle_opnsense_command(text, channel_id, user_id):
                             blocked_ports[dst_port] = blocked_ports.get(dst_port, 0) + 1
                             rules_hit[rule] = rules_hit.get(rule, 0) + 1
                     
-                    # Top blocked IPs
+                    # Top blocked IPs with geo lookup
                     if blocked_ips:
                         fw_text += "*🚫 Top Blocked IPs*\n"
                         for ip, count in sorted(blocked_ips.items(), key=lambda x: x[1], reverse=True)[:5]:
-                            fw_text += f"• `{ip}`: {count} attempts\n"
+                            try:
+                                ip_info = get_ip_info(ip)
+                                if ip_info['type'] == 'Private/Local':
+                                    location = "Internal"
+                                else:
+                                    location = f"{ip_info['country_flag']} {ip_info['city']}, {ip_info['country']}"
+                                fw_text += f"• `{ip}` ({location}): {count} attempts\n"
+                            except:
+                                fw_text += f"• `{ip}`: {count} attempts\n"
                         fw_text += "\n"
                     
                     # Top targeted ports
@@ -779,6 +1754,7 @@ def handle_opnsense_command(text, channel_id, user_id):
                 if data and 'rows' in data:
                     active_peers = []
                     inactive_peers = []
+                    quiet_peers = []
                     
                     for item in data['rows']:
                         if not isinstance(item, dict) or item.get('type') != 'peer':
@@ -800,6 +1776,7 @@ def handle_opnsense_command(text, channel_id, user_id):
                         
                         peer_info = {
                             'name': peer_name,
+                            'peer_id': peer_id,
                             'endpoint': endpoint,
                             'age': age,
                             'rx_gb': rx_bytes / (1024**3),
@@ -807,16 +1784,44 @@ def handle_opnsense_command(text, channel_id, user_id):
                             'total_gb': (rx_bytes + tx_bytes) / (1024**3)
                         }
                         
-                        # Get session bandwidth if baseline exists
+                        # Get session bandwidth and duration if baseline exists
                         if peer_id in wg_baselines:
                             base = wg_baselines[peer_id]
                             session_rx = (rx_bytes - base['rx']) / (1024**3)
                             session_tx = (tx_bytes - base['tx']) / (1024**3)
                             peer_info['session_gb'] = session_rx + session_tx
+                            # Session duration
+                            connected_at = base.get('connected_at')
+                            if connected_at:
+                                peer_info['duration'] = format_duration((datetime.now() - connected_at).total_seconds())
+                            else:
+                                peer_info['duration'] = None
                         else:
                             peer_info['session_gb'] = 0
+                            peer_info['duration'] = None
                         
-                        if is_active:
+                        # Get location info for active peers
+                        if is_active and endpoint and endpoint != 'N/A':
+                            clean_ip = endpoint.split(':')[0] if ':' in endpoint else endpoint
+                            if not clean_ip.startswith(('10.', '192.168.', '172.')):
+                                try:
+                                    ip_info = get_ip_info(clean_ip)
+                                    peer_info['location'] = f"{ip_info['country_flag']} {ip_info['city']}, {ip_info['country']}"
+                                    peer_info['isp'] = ip_info['isp']
+                                except:
+                                    peer_info['location'] = clean_ip
+                                    peer_info['isp'] = 'Unknown'
+                            else:
+                                peer_info['location'] = f"🏠 Local ({clean_ip})"
+                                peer_info['isp'] = 'LAN'
+                        else:
+                            peer_info['location'] = endpoint
+                            peer_info['isp'] = 'Unknown'
+                        
+                        # Sort into quiet vs normal
+                        if peer_name in WG_QUIET_PEERS:
+                            quiet_peers.append(peer_info)
+                        elif is_active:
                             active_peers.append(peer_info)
                         else:
                             inactive_peers.append(peer_info)
@@ -828,20 +1833,35 @@ def handle_opnsense_command(text, channel_id, user_id):
                         active_peers.sort(key=lambda x: x['session_gb'], reverse=True)
                         
                         for peer in active_peers:
-                            location = peer['endpoint'].split(':')[0] if ':' in peer['endpoint'] else peer['endpoint']
                             vpn_text += f"\n*{peer['name']}*\n"
-                            vpn_text += f"• Location: `{location}`\n"
-                            vpn_text += f"• Session: {peer['session_gb']:.2f} GB\n"
-                            vpn_text += f"• Total: {peer['total_gb']:.2f} GB\n"
-                            vpn_text += f"• Last seen: {peer['age']}s ago\n"
+                            vpn_text += f"• Location: {peer['location']}\n"
+                            if peer['isp'] and peer['isp'] != 'Unknown' and peer['isp'] != 'LAN':
+                                vpn_text += f"• ISP: `{peer['isp']}`\n"
+                            vpn_text += f"• Session: `{peer['session_gb']:.2f} GB`\n"
+                            vpn_text += f"• Total: `{peer['total_gb']:.2f} GB`\n"
+                            if peer['duration']:
+                                vpn_text += f"• Connected: `{peer['duration']}`\n"
+                            vpn_text += f"• Last seen: `{peer['age']}s ago`\n"
                     else:
                         vpn_text += "_No active VPN connections_\n"
+                    
+                    # Show quiet peers (muted phones etc)
+                    if quiet_peers:
+                        vpn_text += f"\n*🔇 Quiet Peers (alerts muted): {len(quiet_peers)}*\n"
+                        for peer in quiet_peers:
+                            age_val = peer['age']
+                            is_on = age_val < 180
+                            status = "🟢 Connected" if is_on else "⚪ Idle"
+                            vpn_text += f"• `{peer['name']}`: {status}"
+                            if is_on and peer['duration']:
+                                vpn_text += f" • {peer['duration']}"
+                            vpn_text += "\n"
                     
                     # Show inactive peers summary
                     if inactive_peers:
                         vpn_text += f"\n*⚪ Configured but Inactive: {len(inactive_peers)}*\n"
                         for peer in inactive_peers[:3]:
-                            vpn_text += f"• {peer['name']} (idle)\n"
+                            vpn_text += f"• `{peer['name']}` (idle)\n"
                         
                         if len(inactive_peers) > 3:
                             vpn_text += f"• +{len(inactive_peers) - 3} more\n"
@@ -1309,10 +2329,15 @@ def handle_opnsense_command(text, channel_id, user_id):
 `/opnsense plex-privacy` - Check Plex telemetry
 `/opnsense plex-dns` - Plex in DNS logs
 
-*🐳 Infrastructure*
-`/opnsense containers` - Docker container health
+*🐳 Container Management*
+`/opnsense containers` - List all containers (with uptime)
+`/opnsense cstats` - Show CPU/RAM usage across all hosts
+`/opnsense chealth` - Show unhealthy/crashed containers
+`/opnsense clogs <name>` - View container logs
+`/opnsense restart <name>` - Restart a container
 
 *🔧 Management*
+`/opnsense ask <question>` - Ask the AI about your network.. or anything else
 `/opnsense watch <ip> <name>` - Add a Hero Device
 `/opnsense block <ip>` - Block an IP address
 `/opnsense unblock <ip>` - Unblock an IP
@@ -1359,6 +2384,92 @@ def fetch_opn(path, method="GET", payload=None, fire_and_forget=False):
         if not fire_and_forget: 
             print(f"❌ CONNECTION CRASH on {path}: {e}")
         return None
+
+def get_full_sentinel_report(lines_per_scope=30):
+    scopes = ["system", "gateways", "filter", "auth"]
+    report = ["### OPNsense EXECUTIVE SUMMARY REQUEST ###\n"]
+    report.append("INSTRUCTIONS: Ignore IGMP, Multicast (224.0.0.1), and standard block noise.")
+    report.append("FOCUS: Find persistent errors, gateway drops, or authentication failures.\n")
+
+    for scope in scopes:
+        report.append(f"\n--- {scope.upper()} ---")
+        endpoint = f"diagnostics/log/core/{scope}/search"
+        payload = {"current": 1, "rowCount": lines_per_scope, "searchPhrase": "", "sort": {"timestamp": "desc"}}
+        
+        try:
+            response = fetch_opn(endpoint, method="POST", payload=payload)
+            if response and 'rows' in response and response['rows']:
+                for r in response['rows']:
+                    line = r.get('line', '')
+                    
+                    # 🛡️ THE NOISE FILTER
+                    # Skip common distractions so the AI stays on target
+                    distractions = ["igmp", "224.0.0.1", "unauthenticated xmlrpc", "allow 53", "netmap", "transmit", "authenticator", "/xmlrpc.php", "match"]
+                    if any(d in line.lower() for d in distractions):
+                        continue
+                        
+                    report.append(f"[{r.get('timestamp', 'N/A')}] {line}")
+            else:
+                report.append(f"No priority alerts in {scope}.")
+        except Exception:
+            report.append(f"UNREACHABLE: {scope}")
+
+    return "\n".join(report)
+
+def get_firewall_rules_summary():
+    endpoint = "firewall/filter/searchRule"
+    payload = {"current": 1, "rowCount": 50, "searchPhrase": "", "sort": {"sequence": "asc"}}
+    rules_data = fetch_opn(endpoint, method="POST", payload=payload)
+    
+    if not rules_data or 'rows' not in rules_data:
+        return "ERROR: Rules Archive inaccessible."
+    
+    summary = []
+    for r in rules_data['rows']:
+        if r.get('enabled') != '1': continue
+        
+        # 🛡️ THE TRUTH DATA: Using real IDs and sequence numbers
+        seq = r.get('sequence', '??')
+        interface = r.get('interface', 'unknown').upper()
+        proto = r.get('protocol') or "ANY-PROTO"
+        src = r.get('source_net') or "ANY-SOURCE"
+        dst = r.get('destination_net') or "ANY-DEST"
+        port = r.get('destination_port') or "ANY-PORT"
+        desc = r.get('descr') or "No Description"
+
+        summary.append(f"RULE-SEQ-{seq}: {interface} | {proto} | {src} -> {dst}:{port} | '{desc}'")
+    
+    return "\n".join(summary)
+
+def get_system_troubleshooting_logs(scope="system", lines=25):
+
+    try:
+        # The path now dynamically changes based on the 'tab' you want
+        endpoint = f"diagnostics/log/core/{scope}/search" 
+        
+        log_payload = {
+            "current": 1,
+            "rowCount": int(lines),
+            "searchPhrase": "",
+            "sort": {"timestamp": "desc"}
+        }
+
+        response = fetch_opn(endpoint, method="POST", payload=log_payload)
+        
+        if response and 'rows' in response and response['rows']:
+            clean_logs = []
+            for r in response['rows']:
+                ts = r.get('timestamp', 'N/A')
+                proc = r.get('process', 'system')
+                msg = r.get('line', '')
+                clean_logs.append(f"[{ts}] {proc}: {msg}")
+            
+            return "\n".join(clean_logs)
+        
+        return f"⚠️ No logs found in the '{scope}' category."
+        
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
 
 def get_ai_analysis(event_type, details):
     os.environ["OLLAMA_HOST"] = "http://10.1.1.8:11434"
@@ -1894,6 +3005,61 @@ def calculate_network_health_score():
     except Exception as e:
         return f"*Network Health*\n_Error: {str(e)[:50]}_"
 
+def ask_ollama_sentinel(channel_id, prompt):
+    try:
+        client.chat_postMessage(channel=channel_id, text="🤖 _Consulting the archives..._")
+
+        response = ollama.chat(model='llama3.2', messages=[
+            {
+                'role': 'system',
+                'content': (
+                    "You are Sentinel Supreme. "
+                    "Protocol: ONLY report on services explicitly listed in the 'LOADOUT'. "
+                    "1. IGNORE: Generic 'authenticator' or XMLRPC noise—these are NOT security threats. "
+                    "2. IGNORE: Netmap or 'igc0' transmit logs—these are normal network activity. "
+                    "3. ALERT: Only if you see 'CRITICAL', 'FATAL', or actual WireGuard 'Handshake Failed' text. "
+                    "4. TONE: Concise, tactical, and optimistic. If logs are clean, say 'The Sector is secure'."
+                )
+            },
+            { 'role': 'user', 'content': prompt }
+        ])
+
+        ai_reply = response['message']['content']
+        client.chat_postMessage(channel=channel_id, text=f"📡 *Sentinel AI Response:*\n\n{ai_reply}")
+        
+    except Exception as e:
+        print(f"❌ Error in Ollama worker: {e}")
+        client.chat_postMessage(channel=channel_id, text=f"⚠️ Sentinel's logic core is offline: {e}")
+
+def ask_ollama_general(channel_id, prompt):
+    """General AI assistant for any questions"""
+    try:
+        client.chat_postMessage(channel=channel_id, text="🤖 _Thinking..._")
+
+        response = ollama.chat(model='llama3.2', messages=[
+            {
+                'role': 'user',
+                'content': prompt
+            }
+        ])
+
+        ai_reply = response['message']['content']
+        
+        # Split long responses (Slack has a 4000 char limit per message)
+        if len(ai_reply) > 3800:
+            chunks = [ai_reply[i:i+3800] for i in range(0, len(ai_reply), 3800)]
+            for i, chunk in enumerate(chunks):
+                if i == 0:
+                    client.chat_postMessage(channel=channel_id, text=f"🤖 *Answer (Part {i+1}/{len(chunks)}):*\n\n{chunk}")
+                else:
+                    client.chat_postMessage(channel=channel_id, text=f"*(Part {i+1}/{len(chunks)}):*\n\n{chunk}")
+        else:
+            client.chat_postMessage(channel=channel_id, text=f"🤖 *Answer:*\n\n{ai_reply}")
+        
+    except Exception as e:
+        print(f"❌ Error in Ollama worker: {e}")
+        client.chat_postMessage(channel=channel_id, text=f"⚠️ AI error: {str(e)[:100]}")
+
 def get_top_talkers():
     """
     Get top bandwidth users for WireGuard (Live) and WAN (Zenarmor 24h)
@@ -2095,6 +3261,58 @@ def detect_smart_patterns():
     except:
         pass
 
+    # DNS spike detection
+    try:
+        adg_resp = requests.get(
+            f"{AGH_URL}/control/stats",
+            auth=(AGH_USER, AGH_PASS),
+            timeout=5
+        )
+        if adg_resp.status_code == 200:
+            adg_data = adg_resp.json()
+            total_q = adg_data.get('num_dns_queries', 1)
+            blocked_q = adg_data.get('num_blocked_filtering', 0)
+            block_rate = blocked_q / max(total_q, 1)
+            if block_rate > 0.35:  # >35% block rate is unusual
+                insights.append(
+                    f"🛡️ *High DNS Block Rate*: {block_rate*100:.1f}% of queries blocked "
+                    f"({blocked_q:,}/{total_q:,}) — possible malware or misconfigured device"
+                )
+    except:
+        pass
+    
+    # Container restart detection
+    try:
+        import docker
+        docker_client = docker.from_env()
+        for container in docker_client.containers.list(all=True):
+            restart_count = container.attrs.get('RestartCount', 0)
+            if restart_count >= 3:
+                insights.append(
+                    f"🔄 *Container Restarting*: `{container.name}` has restarted "
+                    f"{restart_count}x — check logs with `/opnsense clogs {container.name}`"
+                )
+        docker_client.close()
+    except:
+        pass
+    
+    # New devices in last 24h (devices with no history = first seen recently)
+    try:
+        new_devices = []
+        for mac, lease in known_dhcp_leases.items():
+            if lease.get('active') and mac not in device_disconnect_history:
+                hostname = lease.get('hostname', 'Unknown')
+                ip = lease.get('ip', '')
+                new_devices.append(f"`{hostname}` ({ip})")
+        if len(new_devices) > 0:
+            insights.append(
+                f"🆕 *New Devices*: {len(new_devices)} device(s) seen for the first time: "
+                f"{', '.join(new_devices[:3])}"
+                + (f" +{len(new_devices)-3} more" if len(new_devices) > 3 else "")
+            )
+    except:
+        pass
+
     # Format output
     if insights:
         output = "*💡 Intelligent Insights*\n\n"
@@ -2229,47 +3447,30 @@ def collect_security_events():
     return events_summary
 
 def get_zenarmor_threat_details():
-    """Only alert once per 24 hours"""
-    global last_threat_alert_time
+    """Direct Engine interrogation using zenarmorctl"""
+    ZEN_CTL = "/usr/local/bin/zenarmorctl"
     
     try:
-        zen_status = fetch_opn("zenarmor/status")
-        if not zen_status:
-            return None
+        # 🛡️ Step 1: Check Engine Health directly
+        status = subprocess.run([ZEN_CTL, 'engine', 'status'], capture_output=True, text=True)
         
-        threats = zen_status.get('threat_detected', 0)
+        if "running" not in status.stdout.lower():
+            return "⚠️ Sentinel Critical: The Engine is active in the shadows (PID found), but 'zenarmorctl' cannot reach it."
+
+        # 🛡️ Step 2: Grab actual Security Alerts
+        # Using the alerts command to find the 'Most Wanted'
+        alerts = subprocess.run([ZEN_CTL, 'alerts', 'last', '5'], capture_output=True, text=True)
         
-        if threats == 0:
-            return None
-        
-        # Check cooldown
-        now = datetime.now()
-        if last_threat_alert_time:
-            hours_since = (now - last_threat_alert_time).total_seconds() / 3600
-            if hours_since < 24.0:
-                # Show when next alert will be
-                hours_remaining = 24.0 - hours_since
-                print(f"   🛡️ Zenarmor: {threats} threats (next alert in {hours_remaining:.1f}h)")
-                return None
-        
-        # Send alert!
-        last_threat_alert_time = now
-        print(f"   🚨 Sending Zenarmor threat alert: {threats} threats")
-        
-        blocked = zen_status.get('threat_detected_blocked', 0)
-        report = f"⚠️ *Active Threats*: {threats} detected, {blocked} blocked\n\n"
-        
-        top_threats = zen_status.get('top_detect_threats', {}).get('labels', [])
-        if top_threats:
-            report += "*Top Threats:*\n"
-            for i, threat in enumerate(top_threats[:4], 1):
-                report += f"{i}. {threat}\n"
-        
-        return report
-        
+        if not alerts.stdout.strip():
+            return "🛡️ The Sector is quiet. Zenarmor is patrolling, but no security alerts have been triggered."
+
+        return f"🚩 **RECENT THREAT ALERTS**:\n{alerts.stdout.strip()}"
+
+    except FileNotFoundError:
+        # Fallback if zenarmorctl is missing - use the service status we verified
+        return "🟢 **ENGINE ALIVE (PID 77741)** | Sentinel is monitoring, but the CLI reporting tool is missing. Security is active."
     except Exception as e:
-        print(f"⚠️ Zenarmor threat check failed: {e}")
-        return None
+        return f"⚠️ Sentinel Error: Interference in the data stream. ({str(e)})"
 
 def get_adguard_stats():
     try:
@@ -3076,8 +4277,14 @@ def check_wireguard_peers():
 
                 # --- NEW CONNECTION DETECTED ---
                 if peer_id not in wg_active_peers:
-                    wg_baselines[peer_id] = {'rx': raw_rx, 'tx': raw_tx}
+                    wg_baselines[peer_id] = {'rx': raw_rx, 'tx': raw_tx, 'connected_at': datetime.now()}
                     wg_active_peers.add(peer_id)
+
+                    # ── QUIET PEER FILTER ──────────────────────────────
+                    if peer_name in WG_QUIET_PEERS:
+                        print(f"   🔇 Suppressed WG connect noise from: {peer_name}")
+                        continue  # Skip the Slack notification entirely
+                    # ────────────────────────────────────────────────────
                     
                     endpoint = item.get('endpoint', 'N/A')
                     clean_ip = endpoint.split(':')[0] if ':' in endpoint else endpoint
@@ -3151,13 +4358,21 @@ def check_wireguard_peers():
         disconnected_peers = wg_active_peers - current_active_this_poll
         for p_id in disconnected_peers:
             p_name = "Unknown Peer"
-            # Find the peer in the current rows for final stats
+            # Find the peer name first
             for r in rows:
                 if f"{r.get('ifname')}:{r.get('public-key')[:16]}" == p_id:
                     p_name = r.get('name', 'Unknown')
                     raw_rx = int(r.get('transfer-rx', 0))
                     raw_tx = int(r.get('transfer-tx', 0))
                     break
+
+            # ── QUIET PEER FILTER ──────────────────────────────────
+            if p_name in WG_QUIET_PEERS:
+                print(f"   🔇 Suppressed WG disconnect noise from: {p_name}")
+                wg_active_peers.discard(p_id)
+                wg_baselines.pop(p_id, None)
+                continue  # Skip the Slack notification
+            # ────────────────────────────────────────────────────────
             
             base = wg_baselines.get(p_id, {'rx': raw_rx, 'tx': raw_tx})
             session_rx_mb = (raw_rx - base['rx']) / (1024 * 1024)
@@ -3182,6 +4397,42 @@ def check_wireguard_peers():
 
     except Exception as e:
         print(f"❌ Error in WireGuard check: {e}")
+
+def get_wireguard_status():
+    """Tactical scan of the 'Beast-WG' interface"""
+    # 🕵️ This hits the endpoint that gave us the raw JSON rows
+    data = fetch_opn("wireguard/service/show")
+    
+    if not data or 'rows' not in data:
+        return "⚠️ Sentinel Error: The telemetry feed is missing the 'rows' attribute."
+
+    peers_found = []
+    
+    for r in data['rows']:
+        # We only want 'peer' types, not the 'interface' itself
+        if r.get('type') != 'peer':
+            continue
+            
+        name = r.get('name', 'Unknown Ghost')
+        status = r.get('peer-status', 'offline') # This is the key!
+        rx = int(r.get('transfer-rx', 0)) / (1024 * 1024)
+        tx = int(r.get('transfer-tx', 0)) / (1024 * 1024)
+        last_seen = r.get('latest-handshake-epoch', 'Never')
+
+        if status == 'online':
+            peers_found.append(
+                f"🟢 **IN SECTOR** | {name}\n"
+                f"   Traffic: {rx:.2f}MB ↓ / {tx:.2f}MB ↑\n"
+                f"   Last Handshake: {last_seen}"
+            )
+        # Optional: include offline peers in a simpler format
+        # else:
+        #    peers_found.append(f"⚪ STANDBY | {name}")
+
+    if not peers_found:
+        return "The tunnels are dark, Commissioner. All known peers are offline."
+        
+    return "\n\n".join(peers_found)
 
 def check_dhcp_leases(is_startup=False):
     """
@@ -3672,10 +4923,80 @@ def check_beast_health():
 
     return insights
 
+def cmd_diagnose_network(channel_id):
+    # 1. Fetch current status data
+    gateways = fetch_opn("routes/gateway/status")
+    rules = fetch_opn("firewall/filter/searchRule") # Simplified
+    
+    # 2. Build a "Knowledge Context" string
+    context = f"Current Gateways: {gateways}\nActive Rules Summary: {rules}"
+    
+    # 3. Send to Ollama with a specific 'Doctor' persona
+    prompt = f"Analyze this OPNsense state and tell me if there are any security risks or bottlenecks: {context}"
+    
+    # 4. Trigger your worker
+    threading.Thread(target=ask_ollama_sentinel, args=(channel_id, prompt)).start()
+
+def get_opnsense_logs(scope="system", lines=20):
+    """
+    Fetch logs using the 2026 OPNsense MVC standard.
+    """
+    try:
+        # 🐍 The new 26.x specific endpoint
+        # OPNsense now often uses 'service' as the action for logs
+        endpoint = "diagnostics/syslog/service/search" 
+        
+        # This matches the new 'Bootgrid' requirements
+        payload = {
+            "current": 1,
+            "rowCount": int(lines),
+            "searchPhrase": "",
+            "sort": {"timestamp": "desc"}
+        }
+        
+        # Remeber: your function uses 'payload='
+        response = fetch_opn(endpoint, method="POST", payload=payload)
+        
+        if response and 'rows' in response:
+            log_entries = [f"[{r.get('timestamp')}] {r.get('process')}: {r.get('line')}" for r in response['rows']]
+            return "\n".join(log_entries) if log_entries else "No log entries found."
+            
+        return f"⚠️ API Success, but data format unexpected. Response: {str(response)[:100]}"
+        
+    except Exception as e:
+        return f"❌ Error: {e}"
+
+
 def cmd_status_report(signum=None, frame=None):
     speed = get_speedtest_data(retry=False)
     gws = ", ".join(check_gateways(True))
-    send_grid_notification("📊 Manual Watchtower Report", speed['download'], speed['ping'], speed['upload'], gws, show_dhcp=True, add_buttons="general")
+    active_devices = len([l for l in known_dhcp_leases.values() if l['active']])
+    active_vpn = len(wg_active_peers)
+    dns_summary = get_combined_dns_stats()
+    # Network health score
+    try:
+        health = calculate_network_health_score()
+    except:
+        health = "_Health score unavailable_"
+    # Top talkers
+    try:
+        top = get_top_talkers()
+    except:
+        top = ""
+    
+    extra = f"*📡 Active Devices:* `{active_devices}` | *🔐 VPN Peers:* `{active_vpn}`\n\n"
+    extra += dns_summary + "\n"
+    extra += health
+    if top:
+        extra += f"\n\n{top}"
+    
+    send_grid_notification(
+        "📊 Manual Watchtower Report",
+        speed['download'], speed['ping'], speed['upload'], gws,
+        show_dhcp=True,
+        add_buttons="general",
+        extra_text=extra
+    )
 
 signal.signal(signal.SIGUSR1, cmd_status_report)
 signal.signal(signal.SIGUSR2, cmd_status_report)

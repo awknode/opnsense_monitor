@@ -548,10 +548,7 @@ Timezone: `America/Denver` (MST/MDT)
 
 ## 📞 Support
 
-- GitHub Issues: [Report bugs](https://github.com/yourusername/opnsense-sentinel/issues)
-- Documentation: [Wiki](https://github.com/yourusername/opnsense-sentinel/wiki)
-- Slack: #opnsense-monitor
-
+- GitHub Issues: [Report bugs](https://github.com/awknode/opnsense_monitor/issues)
 ---
 
 **Made with 🦇 in Denver, Colorado**
